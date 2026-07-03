@@ -235,6 +235,7 @@ widen it for synths with `Song(pitch_range=(0, 127))`.
 | `examples/dynamo_rag.py` | a full multi-strain ragtime: stride bass, written syncopation, subdominant trio |
 | `examples/silver_dollar_saloon.py` | a frontier two-step: oom-pah, honky-tonk grace slides, shave-and-a-haircut tag |
 | `examples/nickelodeon.py` | a player-piano novelty roll: generated figuration, secondary-rag accents, whole-tone runs |
+| `examples/player_piano_studies.py` | five Nancarrow-style studies built through the raw `Note` API: tempo canon, coprime ostinati, acceleration, full-keyboard cascades, tutti |
 | `examples/minuet_small_computer.py` | sections, waltz harmony, arrangement |
 | `examples/blues_416_megabytes.py` | swing, grace notes, stride, rubato |
 | `examples/invention_two_processes.py` | motif transforms, two-voice counterpoint, lint |
