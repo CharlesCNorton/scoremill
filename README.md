@@ -232,6 +232,9 @@ widen it for synths with `Song(pitch_range=(0, 127))`.
 | File | Demonstrates |
 |---|---|
 | `examples/saltarello_alla_chico.py` | the demo score: variants, per-section keys, grace notes, trill, accelerando |
+| `examples/dynamo_rag.py` | a full multi-strain ragtime: stride bass, written syncopation, subdominant trio |
+| `examples/silver_dollar_saloon.py` | a frontier two-step: oom-pah, honky-tonk grace slides, shave-and-a-haircut tag |
+| `examples/nickelodeon.py` | a player-piano novelty roll: generated figuration, secondary-rag accents, whole-tone runs |
 | `examples/minuet_small_computer.py` | sections, waltz harmony, arrangement |
 | `examples/blues_416_megabytes.py` | swing, grace notes, stride, rubato |
 | `examples/invention_two_processes.py` | motif transforms, two-voice counterpoint, lint |
