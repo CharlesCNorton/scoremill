@@ -98,11 +98,11 @@ voice 'A.rh' bar 2: has 3.0 beats, expected 4.0 — short by 1.0 beats (a 'q').
 | Pitch | `c d e f g a b` + `# b n` + octave | octave is sticky per voice; key signature applies (`key="F"` makes `b` mean B-flat, `bn` natural); minor keys (`Am`, `Dm`, ...) supported |
 | Duration | trailing `w h q e s t`, optional `.` | sticky; `r` = rest |
 | Chord | `[c4 e g]h` | shared duration |
-| Tuplet | `{c4 d4 e4}q` | members divide the span equally |
+| Tuplet | `{c4 d4 e4}q`, `{[c4 e4] d4}q` | members divide the span equally; a member may be a chord |
 | Grace | `+d5` | sounds just before the next note; stackable |
-| Tie | `c5h~` | the next note must repeat the pitch (validated) |
-| Marks | `>` accent · `'` staccato · `_` legato · `^` fermata · `&` roll · `%` trill | after the duration |
-| Dynamics | `!pp !p !mp !mf !f !ff`, `cresc`, `dim` | sticky; cresc/dim interpolate to the next mark, which must exist (validated) |
+| Tie | `c5h~` | the next note must repeat the pitch (validated); a tie on a voice's last note is laissez vibrer |
+| Marks | `>` accent · `'` staccato · `_` legato · `^` fermata · `&` roll · `%` trill | after the duration; fermata length and trill rate are configurable on `Song` |
+| Dynamics | `!ppp !pp !p !mp !mf !f !ff !fff`, `cresc`, `dim` | sticky; cresc/dim interpolate to the next mark, which must exist (validated) |
 | Barline | `\|` | asserts the bar is exactly full |
 
 ## Motif transforms
@@ -115,33 +115,48 @@ shift(frag, 2)              # diatonic sequence up two steps
 invert(frag, axis="g4")     # mirror about an axis pitch
 retro(frag)                 # retrograde
 stretch(frag, 2)            # augmentation (0.5 for diminution)
+rebar(frag, 3)              # re-insert barlines every 3 beats
 ```
 
 Explicit alterations travel with their scale degree under `shift` and
 are mirrored under `invert` (a raised degree inverts to a lowered
 one). `retro` insists the fragment contain no barlines, dynamics, or
-ties; apply those around the result.
+ties; apply those around the result. `stretch` changes durations and
+therefore the barring, so pair it with `rebar`, which re-inserts
+barlines at a chosen bar length and errors if a note would straddle
+one.
 
 ## Harmony
 
 ```python
-voice.harmony("C Am7 F G7", style="stride", voicing="smooth")
+voice.harmony("C Am7 F G7", style="stride", voicing="smooth",
+              avoid=melody)
 ```
 
-Sixteen chord qualities (`m 7 maj7 m7 6 m6 dim dim7 m7b5 aug sus2 sus4
-9 maj9 m9 add9`), slash basses (`C/G`), and eight accompaniment styles
-(`block root fifth waltz alberti arp broken stride`).
-`voicing="smooth"` chooses inversions that minimize movement between
-chords. `harmony()` takes its own `octave` argument for the register
-of the chord roots; it is independent of the octave state the voice
-uses for melodic input.
+Twenty-six chord qualities (`m 7 maj7 m7 6 m6 dim dim7 m7b5 aug sus2
+sus4 9 maj9 m9 add9 mmaj7 m11 7sus4 9sus4 7b5 7#5 7b9 7#9 11 13`),
+slash basses (`C/G`), and eight accompaniment styles (`block root
+fifth waltz alberti arp broken stride`; waltz, stride, and broken fill
+fractional meters). `voicing="smooth"` chooses inversions that
+minimize movement between chords. `harmony()` takes its own `octave`
+argument for the register of the chord roots, independent of the
+octave the voice uses for melodic input.
+
+`avoid=<voice>` makes the accompaniment melody-aware: chord tones that
+would double the named voice's pitch classes on a shared onset are
+dropped, and single figure tones that would collide at the exact
+unison move an octave away. When the song declares a pickup and the
+accompaniment voice is still empty, `harmony()` inserts the pickup
+rest itself.
 
 ## Expression
 
 ```python
-Song(swing=0.62, humanize=2, expressive=True)
-section.rubato(0.05, phrase=2)      # tempo arch per phrase
-section.pedal("bar")                # sustain, re-pedaled per bar
+Song(swing=0.62, swing_unit="sixteenth", humanize=2, expressive=True,
+     fermata=1.6, trill_rate=0.125)
+section.rubato(0.05, phrase=2, shape="arch")   # or "cradle"
+section.pedal("bar")                # "half", or a number of beats
+section.soft()                      # una corda for the section
 s.tempo_change("A", bar=5, bpm=80)  # step change
 s.ritardando("A", 7, 8, 60)         # linear ramp; a faster target
                                     # produces an accelerando
@@ -149,16 +164,24 @@ s.ritardando("A", 7, 8, 60)         # linear ramp; a faster target
 
 `expressive` adds downbeat lean, melodic-contour shading, and top-note
 voicing inside chords; `humanize` adds slight timing and velocity
-variation.
+variation. `swing_unit` swings eighths or sixteenths; `fermata` sets
+how far a `^` note overshoots its written length; `trill_rate` sets a
+`%` trill's alternation speed. Rubato is an `"arch"` that presses
+forward and relaxes, or a `"cradle"` that broadens mid-phrase.
 
 ## Analysis
 
 ```python
-s.lint()      # unison collisions, parallel fifths/octaves, per section
+s.lint()      # collisions and parallels, located by bar and beat
 s.report()    # dict: sections, voices, ranges, density, duration, lint
 ```
 
-`report()` exists so an agent can check its own work programmatically:
+`lint()` reports two things, each located by bar and beat: collisions,
+where two voices sound the same pitch at once, whether struck together
+or struck against a held note; and consecutive parallel fifths or
+octaves, checked on both the top and the bottom line of each voice
+pair. `report()` exists so an agent can check its own work
+programmatically, and its duration integrates the full tempo map:
 
 ```python
 assert s.report()["duration_s"] < 180
@@ -168,14 +191,34 @@ assert not s.report()["lint"]
 The linter is advisory. Styles that double the tune and the
 accompaniment on strong beats will trip the parallel checks on
 purpose; read the findings, keep the ones that are idiom, fix the
-ones that are accidents.
+ones that are accidents. When a texture doubles by design, pass
+`lint(mode="homophonic")` to keep only the collisions.
+
+## Raw access
+
+Notation is the front door, not the only one. `song.events()` returns
+the fully expressive event stream as sorted `(tick, kind, channel, a,
+b)` tuples at 480 ticks per beat, exactly what `save()` and `play()`
+render, for agents that prefer to work below the notation:
+
+```python
+for tick, kind, ch, a, b in song.events():
+    ...            # kind in {"on", "off", "cc64", "cc67", "tempo"}
+```
+
+`Song`, `Voice`, the transforms, and the renderer are ordinary Python,
+importable a la carte; a `Voice`'s `notes` list accepts hand-built
+`Note` objects, which bypass notation validation.
 
 ## Playback
 
 `play()` streams in real time through [mido](https://mido.readthedocs.io)
 (requires `python-rtmidi`). It picks the first hardware output, or
-match one by substring: `s.play(port="FluidSynth")`. Without hardware,
-render with `save()` and use any soft synth, for example:
+match one by substring: `s.play(port="FluidSynth")`. `play(count_in=4)`
+taps four beats before the music; `play(progress=fn)` calls `fn` with
+each message as it goes out. Playback releases all notes and both
+pedals on exit, so an interrupt leaves nothing hanging. Without
+hardware, render with `save()` and use any soft synth, for example:
 
 ```
 fluidsynth -a pulseaudio soundfont.sf2 piece.mid

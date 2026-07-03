@@ -4,8 +4,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scoremill import (CompositionError, Song, invert, retro, shift,
-                       stretch)
+from scoremill import (CompositionError, Song, invert, rebar, retro,
+                       shift, stretch)
 
 
 def test_transforms():
@@ -130,6 +130,127 @@ def test_section_time_override():
     sec = song.section("W", time="6/8")
     sec.voice("m").bars("c4e d4e e4e f4e g4e a4e |")
     assert sec.length_beats() == 3.0
+
+
+def test_rebar_inserts_barlines():
+    assert rebar("c4q d4 e4 d4 c4 d4", 3) == "c4q d4 e4 | d4 c4 d4 |"
+
+
+def test_rebar_rejects_crossing_token():
+    try:
+        rebar("c4h d4h", 3)
+        raise AssertionError("crossing check did not fire")
+    except CompositionError as e:
+        assert "crosses" in str(e)
+
+
+def test_tuplet_admits_chords():
+    voice = Song().section("TC").voice("m")
+    voice.bars("{[c4 e4] d4 [c4 e4]}q c4q c4h |")
+    assert abs(voice.total_beats() - 4.0) < 1e-9
+    assert voice.notes[0].pitches == [60, 64]
+
+
+def test_extended_chord_qualities():
+    voice = Song().section("Q").voice("x")
+    voice.harmony("C13 Fm11 G7b9 D7#5", style="block")
+    assert len(voice.notes[0].pitches) == 5      # a thirteenth
+
+
+def test_extended_dynamic_range():
+    voice = Song().section("DY").voice("m")
+    voice.bars("!ppp c4q !fff d4q c4h |")
+    assert voice.notes[0].vel == 18
+    assert voice.notes[1].vel == 96
+
+
+def test_final_tie_is_laissez_vibrer():
+    song = Song()
+    song.section("LV").voice("m").bars("c4h c4h~ |")
+    song.arrange("LV")
+    song.report()          # a dangling final tie must not raise
+    offs = [t for (t, k, _, _, _) in song.events() if k == "off"]
+    assert max(offs) > 1920
+
+
+def test_lint_locates_by_bar():
+    song = Song()
+    song.section("X").voice("a").bars("c4q d4q e4q f4q |")
+    song.sections["X"].voice("b").bars("g4q a4q b4q c5q |")
+    song.arrange("X")
+    findings = song.lint(quiet=True)
+    assert findings and all("bar" in f for f in findings)
+
+
+def test_lint_homophonic_drops_parallels():
+    song = Song()
+    song.section("X").voice("a").bars("c4q d4q e4q f4q |")
+    song.sections["X"].voice("b").bars("g4q a4q b4q c5q |")
+    song.arrange("X")
+    assert song.lint(quiet=True, mode="homophonic") == []
+
+
+def test_lint_catches_held_note_collision():
+    song = Song()
+    song.section("H").voice("a").bars("c4w |")
+    song.sections["H"].voice("b").bars("rh c4h |")
+    song.arrange("H")
+    findings = song.lint(quiet=True)
+    assert any("bar 1 beat 3" in f for f in findings)
+
+
+def test_harmony_avoid_drops_doubling():
+    song = Song()
+    sec = song.section("AV")
+    mel = sec.voice("rh")
+    mel.bars("e4w |")
+    sec.voice("lh").harmony("C", style="block", avoid=mel)
+    classes = {p % 12 for p in sec.voices[1].notes[0].pitches}
+    assert 4 not in classes and {0, 7} <= classes
+
+
+def test_soft_pedal_emits_cc67():
+    song = Song()
+    song.section("SP").voice("m").bars("c4w |")
+    song.sections["SP"].soft()
+    song.arrange("SP")
+    assert "cc67" in {k for (_, k, _, _, _) in song.events()}
+
+
+def test_events_exposes_raw_stream():
+    song = Song(tempo=120)
+    song.section("EV").voice("m").bars("c4q e4q g4q c5q |")
+    song.arrange("EV")
+    ev = song.events()
+    assert any(k == "on" for (_, k, _, _, _) in ev)
+    assert len(song._count_in_taps(4)) == 8
+
+
+def test_duration_integrates_ritardando():
+    song = Song(tempo=120)
+    song.section("DR").voice("m").bars("c4w | c4w | c4w | c4w |")
+    song.ritardando("DR", 1, 4, 60)
+    song.arrange("DR")
+    assert song.report()["duration_s"] > 8.0
+
+
+def test_pickup_allows_full_first_bar():
+    song = Song(pickup=1)
+    voice = song.section("PU").voice("m")
+    voice.bars("c4q d4q e4q f4q | g4q a4q b4q c5q |")
+    assert abs(voice.total_beats() - 8.0) < 1e-9
+
+
+def test_swing_sixteenth_unit():
+    straight = Song(swing=0.5)
+    straight.section("A").voice("m").bars("c4s d4s e4s f4s g4q c5h |")
+    swung = Song(swing=0.66, swing_unit="sixteenth")
+    swung.section("A").voice("m").bars("c4s d4s e4s f4s g4q c5h |")
+    straight.arrange("A")
+    swung.arrange("A")
+    on_s = [t for (t, k, _, _, _) in straight.events() if k == "on"]
+    on_w = [t for (t, k, _, _, _) in swung.events() if k == "on"]
+    assert on_w[1] > on_s[1]      # the offbeat sixteenth is delayed
 
 
 def test_minor_key_signature():
