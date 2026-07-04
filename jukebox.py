@@ -58,14 +58,20 @@ def pretty_title(path):
 
 
 # ── rendering ────────────────────────────────────────────────
-def render_scores(src_dir, log=lambda s: None):
+def render_scores(src_dir, log=lambda s: None, force=False):
     """Run each *.py in src_dir so it writes its MIDI (the scoremill
     contract), then return the sorted list of .mid files present.
     Rendering is idempotent: a script simply overwrites its own output,
-    and one script may write several files. Returns (midi_paths,
-    errors)."""
+    and one script may write several files. A script is skipped when
+    the directory already holds MIDI at least as new as it, so a
+    repeat launch with nothing edited renders nothing; pass force=True
+    to render regardless. Returns (midi_paths, errors)."""
     errors = []
+    existing = glob.glob(os.path.join(src_dir, "*.mid"))
+    newest = max((os.path.getmtime(m) for m in existing), default=-1.0)
     for script in sorted(glob.glob(os.path.join(src_dir, "*.py"))):
+        if not force and newest >= os.path.getmtime(script):
+            continue                    # a render newer than this script exists
         log(f"rendering {os.path.basename(script)} ...")
         try:
             subprocess.run([sys.executable, script],
@@ -297,9 +303,9 @@ class Jukebox:
         return None
 
 
-def build_tracks(src_dir):
-    midis, errors = render_scores(src_dir, log=lambda s: print(s,
-                                                               file=sys.stderr))
+def build_tracks(src_dir, force=False):
+    midis, errors = render_scores(
+        src_dir, log=lambda s: print(s, file=sys.stderr), force=force)
     for e in errors:
         print(f"warning: {e}", file=sys.stderr)
     return [(pretty_title(m), m) for m in midis]
@@ -383,7 +389,7 @@ def main(argv):
         jb = Jukebox(tracks, port=port)
         result = jb.run()
         if result == "rerender":
-            tracks = build_tracks(src_dir)
+            tracks = build_tracks(src_dir, force=True)
             continue
         break
     return 0
