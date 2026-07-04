@@ -195,6 +195,54 @@ def _resolve_key(key):
         f"{sorted(RELATIVE_MAJOR)}")
 
 
+# Chromatic tonic names for relabeling a transposed key. Flat spellings
+# match scoremill's flat-key signatures; each supported key name maps to
+# a pitch class here.
+_KEY_PC = {"C": 0, "C#": 1, "Db": 1, "D": 2, "Eb": 3, "E": 4, "F": 5,
+           "F#": 6, "Gb": 6, "G": 7, "Ab": 8, "A": 9, "Bb": 10, "B": 11}
+_PC_KEY = {0: "C", 1: "Db", 2: "D", 3: "Eb", 4: "E", 5: "F", 6: "F#",
+           7: "G", 8: "Ab", 9: "A", 10: "Bb", 11: "B"}
+
+
+def _transpose_key(key, semitones):
+    """Relabel a key name (major 'Eb' or minor 'Cm') by semitones,
+    keeping the mode. Unknown names pass through unchanged."""
+    minor = key.endswith("m")
+    root = key[:-1] if minor else key
+    if root not in _KEY_PC:
+        return key
+    name = _PC_KEY[(_KEY_PC[root] + semitones) % 12]
+    return name + "m" if minor else name
+
+
+def chord_pitches(symbol, octave=4):
+    """The MIDI pitches of a chord symbol ('Cmaj9', 'D7b9', 'F/A'), with
+    a slash bass first when present. A query helper for building
+    accompaniment or checking harmony without a Song."""
+    m = SYM_RE.match(symbol)
+    if not m:
+        raise CompositionError(
+            f"chord_pitches: bad symbol '{symbol}' (qualities: "
+            f"{' '.join(sorted(q for q in CHORD_QUALITY if q))})")
+    root_l, root_a, qual, bass_l, bass_a = m.groups()
+    root = 12 * (octave + 1) + _pc(root_l.lower(), root_a)
+    tones = [root + iv for iv in CHORD_QUALITY[qual or ""]]
+    if bass_l:
+        tones.insert(0, 12 * octave + _pc(bass_l.lower(), bass_a))
+    return tones
+
+
+def scale_pitches(key, octave=4):
+    """The seven MIDI pitches of a key's diatonic scale, ascending from
+    the tonic. Major keys give the major scale; minor keys ('Am') give
+    the natural minor. A query helper for melody construction."""
+    sig = _resolve_key(key)
+    tonic = key[0].lower()
+    start = LETTERS.index(tonic)
+    return [12 * (octave + 1) + _pc(LETTERS[(start + i) % 7], "", sig)
+            + 12 * ((start + i) // 7) for i in range(7)]
+
+
 def _pc(letter, acc, key="C"):
     v = STEP[letter]
     if acc == "n":
@@ -695,6 +743,10 @@ class Voice:
                 if n.pitches:
                     avoid_map.setdefault(round(t, 6), set()).update(n.pitches)
                 t += n.beats
+        if voicing not in ("plain", "smooth", "shell", "rootless", "drop2"):
+            raise CompositionError(
+                "harmony: voicing is plain, smooth, shell, rootless, "
+                f"or drop2 (got {voicing!r})")
         slot_beats = self.bpb if slots == "bar" else self.bpb / 2
         prev_sym = None
         prev_voicing = None
@@ -707,8 +759,10 @@ class Voice:
                     raise CompositionError("harmony: '.' with no prior chord")
                 sym = prev_sym
             prev_sym = sym
-            tones = self._chord_pitches(sym, octave)
-            if voicing == "smooth" and prev_voicing:
+            tones, has_bass = self._chord_pitches(sym, octave)
+            if voicing in ("shell", "rootless", "drop2"):
+                tones = self._voice_chord(tones, has_bass, voicing)
+            elif voicing == "smooth" and prev_voicing:
                 tones = [tones[0]] + self._lead(prev_voicing[1:], tones[1:])
             prev_voicing = tones
             self._figure(tones, style, slot_beats, t0, avoid_map)
@@ -755,9 +809,42 @@ class Voice:
         root_l, root_a, qual, bass_l, bass_a = m.groups()
         root = 12 * (octave + 1) + _pc(root_l.lower(), root_a)
         tones = [root + iv for iv in CHORD_QUALITY[qual or ""]]
+        has_bass = False
         if bass_l:
             tones.insert(0, 12 * octave + _pc(bass_l.lower(), bass_a))
-        return tones
+            has_bass = True
+        return tones, has_bass
+
+    @staticmethod
+    def _voice_chord(tones, has_bass, mode):
+        """Re-voice a chord's tones. 'shell' keeps root, third, and
+        seventh (or fifth if there is no seventh); 'rootless' drops the
+        root for the accompaniment while a slash bass, if present, is
+        kept; 'drop2' lowers the second voice from the top by an octave.
+        A slash bass is never disturbed."""
+        bass = [tones[0]] if has_bass else []
+        core = tones[1:] if has_bass else list(tones)
+        if not core:
+            return tones
+        root = core[0]
+        if mode == "shell":
+            third = next((t for t in core if (t - root) % 12 in (3, 4)), None)
+            seventh = next((t for t in core if (t - root) % 12 in (10, 11)),
+                           None)
+            fifth = next((t for t in core if (t - root) % 12 in (6, 7, 8)),
+                         None)
+            sel = [root] + [x for x in (third, seventh or fifth)
+                            if x is not None]
+            core = sorted(set(sel))
+        elif mode == "rootless":
+            if len(core) >= 3:
+                core = core[1:]                      # drop the root
+        elif mode == "drop2":
+            core = sorted(core)
+            if len(core) >= 2:
+                core[-2] -= 12
+                core = sorted(core)
+        return bass + core
 
     def _figure(self, tones, style, beats, t0=0.0, avoid_map=None):
         v = self._vel
@@ -965,6 +1052,25 @@ class Song:
         for name in self.order:
             if name not in self.sections:
                 raise CompositionError(f"arrange: unknown section '{name}'")
+        return self
+
+    def transpose(self, semitones):
+        """Shift every already-entered note by a number of semitones,
+        in place, and relabel the keys. Call it after the sections are
+        written. Raises if any note would leave the instrument range."""
+        for sec in self.sections.values():
+            for v in sec.voices:
+                for n in v.notes:
+                    for p in n.pitches:
+                        if not self.pitch_lo <= p + semitones <= self.pitch_hi:
+                            raise CompositionError(
+                                f"transpose by {semitones}: MIDI {p} would "
+                                f"leave the range {self.pitch_lo}-"
+                                f"{self.pitch_hi}")
+                    n.pitches = [p + semitones for p in n.pitches]
+            if sec.key:
+                sec.key = _transpose_key(sec.key, semitones)
+        self.key = _transpose_key(self.key, semitones)
         return self
 
     def tempo_change(self, section, bar, bpm):
@@ -1632,6 +1738,30 @@ def _test():
     puv = pu.section("PU").voice("m")
     puv.bars("c4q d4q e4q f4q | g4q a4q b4q c5q |")
     assert abs(puv.total_beats() - 8.0) < 1e-9
+
+    # Query helpers: chord and scale pitches.
+    assert chord_pitches("Cmaj9") == [60, 64, 67, 71, 74]
+    assert chord_pitches("C/G")[0] % 12 == 7
+    assert scale_pitches("C") == [60, 62, 64, 65, 67, 69, 71]
+    assert scale_pitches("Am") == [69, 71, 72, 74, 76, 77, 79]
+
+    # Chromatic transpose shifts pitches and relabels the key.
+    tr = Song(key="C")
+    tr.section("A").voice("m").bars("c4q e4q g4q c5q |")
+    tr.arrange("A")
+    tr.transpose(3)
+    assert tr.sections["A"].voices[0].notes[0].pitches == [63]
+    assert tr.key == "Eb"
+
+    # Harmony voicings: shell = root/third/seventh; drop2 spreads wider.
+    sh = Song().section("S").voice("x")
+    sh.harmony("Cmaj7", style="block", voicing="shell")
+    assert sorted(p % 12 for p in sh.notes[0].pitches) == [0, 4, 11]
+    try:
+        Song().section("U").voice("x").harmony("C", voicing="bogus")
+        raise AssertionError("voicing check did not fire")
+    except CompositionError as e:
+        assert "voicing" in str(e)
 
     print("tests passed")
 

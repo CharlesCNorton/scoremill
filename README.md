@@ -126,6 +126,11 @@ therefore the barring, so pair it with `rebar`, which re-inserts
 barlines at a chosen bar length and errors if a note would straddle
 one.
 
+To move a finished piece to another key, `song.transpose(semitones)`
+shifts every entered note in place and relabels the keys, raising if a
+note would leave the instrument range. This is chromatic transposition
+of the whole song, distinct from the diatonic `shift` on fragments.
+
 ## Harmony
 
 ```python
@@ -137,10 +142,14 @@ Twenty-six chord qualities (`m 7 maj7 m7 6 m6 dim dim7 m7b5 aug sus2
 sus4 9 maj9 m9 add9 mmaj7 m11 7sus4 9sus4 7b5 7#5 7b9 7#9 11 13`),
 slash basses (`C/G`), and eight accompaniment styles (`block root
 fifth waltz alberti arp broken stride`; waltz, stride, and broken fill
-fractional meters). `voicing="smooth"` chooses inversions that
-minimize movement between chords. `harmony()` takes its own `octave`
-argument for the register of the chord roots, independent of the
-octave the voice uses for melodic input.
+fractional meters). `voicing=` chooses how each chord is spelled:
+`plain` (close position), `smooth` (inversions that minimize movement
+between chords), `shell` (root, third, and seventh), `rootless` (drop
+the root for a comping color), or `drop2` (lower the second voice from
+the top an octave, a wider open spread). A slash bass is never
+disturbed. `harmony()` takes its own `octave` argument for the
+register of the chord roots, independent of the octave the voice uses
+for melodic input.
 
 `avoid=<voice>` makes the accompaniment melody-aware: chord tones that
 would double the named voice's pitch classes on a shared onset are
@@ -210,6 +219,12 @@ for tick, kind, ch, a, b in song.events():
 importable a la carte; a `Voice`'s `notes` list accepts hand-built
 `Note` objects, which bypass notation validation.
 
+Two query helpers answer "what notes are in this?" without a Song, so
+an agent can reason about harmony directly: `chord_pitches("Cmaj9")`
+returns the MIDI pitches of a chord symbol (slash bass first when
+present), and `scale_pitches("Am")` returns the seven pitches of a
+key's diatonic scale, ascending from the tonic.
+
 ## Playback
 
 `play()` streams in real time through [mido](https://mido.readthedocs.io)
@@ -265,7 +280,23 @@ Interactive: a number or `p N` plays; `s` stop, `n`/`b` next/back,
 `a` autoplay, `l` loop, `t N` tempo %, `v N` volume, `x N` voice
 (GM program), `r` re-render, `q` quit. It prefers a real instrument
 port and warns when only a MIDI loopback is available (which makes no
-sound). Requires `python-rtmidi` for output ports.
+sound). Requires `python-rtmidi` for output ports. Re-launching is
+instant, since scores already rendered are not rebuilt.
+
+To play an instrument attached to another machine, run the jukebox on
+the far side too:
+
+```
+python jukebox.py --forward           # on the host with the instrument
+python jukebox.py --remote HOST       # on the host driving playback
+```
+
+The `--remote` side streams each MIDI message over TCP to the
+`--forward` side, which relays it to a local port; the driving machine
+needs no MIDI hardware or backend, only `mido` to parse the scores.
+The forwarder re-selects the instrument on each connection, so it may
+start before the instrument is powered on, and it releases every note
+if the client drops.
 
 ## License
 

@@ -5,8 +5,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import jukebox
-from scoremill import (CompositionError, Song, invert, rebar, retro,
-                       shift, stretch)
+from scoremill import (CompositionError, Song, chord_pitches, invert,
+                       rebar, retro, scale_pitches, shift, stretch)
 
 
 def test_transforms():
@@ -252,6 +252,70 @@ def test_swing_sixteenth_unit():
     on_s = [t for (t, k, _, _, _) in straight.events() if k == "on"]
     on_w = [t for (t, k, _, _, _) in swung.events() if k == "on"]
     assert on_w[1] > on_s[1]      # the offbeat sixteenth is delayed
+
+
+def test_chord_pitches_helper():
+    assert chord_pitches("C") == [60, 64, 67]
+    assert chord_pitches("Cmaj9") == [60, 64, 67, 71, 74]
+    assert chord_pitches("C/G")[0] % 12 == 7          # slash bass first
+
+
+def test_scale_pitches_helper():
+    assert scale_pitches("C") == [60, 62, 64, 65, 67, 69, 71]
+    assert scale_pitches("Am") == [69, 71, 72, 74, 76, 77, 79]
+    assert scale_pitches("F")[6] == 76                # E natural in F major
+
+
+def test_transpose_shifts_and_relabels():
+    song = Song(key="C")
+    song.section("A").voice("m").bars("c4q e4q g4q c5q |")
+    song.arrange("A")
+    song.transpose(3)
+    assert song.sections["A"].voices[0].notes[0].pitches == [63]
+    assert song.key == "Eb"
+
+
+def test_transpose_range_guard():
+    song = Song()
+    song.section("H").voice("m").bars("a7q a7q a7q a7q |")
+    song.arrange("H")
+    try:
+        song.transpose(24)
+        raise AssertionError("range guard did not fire")
+    except CompositionError as e:
+        assert "range" in str(e)
+
+
+def test_voicing_shell():
+    voice = Song().section("S").voice("x")
+    voice.harmony("Cmaj7", style="block", voicing="shell")
+    assert sorted(p % 12 for p in voice.notes[0].pitches) == [0, 4, 11]
+
+
+def test_voicing_rootless_drops_root():
+    voice = Song().section("R").voice("x")
+    voice.harmony("Cmaj9", style="block", voicing="rootless")
+    assert 0 not in [p % 12 for p in voice.notes[0].pitches]
+
+
+def test_voicing_drop2_widens_spread():
+    drop = Song().section("D").voice("x")
+    drop.harmony("Cmaj7", style="block", voicing="drop2")
+    plain = Song().section("P").voice("y")
+    plain.harmony("Cmaj7", style="block", voicing="plain")
+
+    def spread(v):
+        p = v.notes[0].pitches
+        return max(p) - min(p)
+    assert spread(drop) > spread(plain)
+
+
+def test_voicing_unknown_rejected():
+    try:
+        Song().section("U").voice("x").harmony("C", voicing="bogus")
+        raise AssertionError("voicing check did not fire")
+    except CompositionError as e:
+        assert "voicing" in str(e)
 
 
 def test_jukebox_tempo_factor():

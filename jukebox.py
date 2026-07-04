@@ -13,6 +13,17 @@ the playlist is whatever scoremill scripts you point it at.
   python jukebox.py --all           # play the whole playlist in order
   python jukebox.py --dir myscores --port "FluidSynth"
 
+Network play (run the jukebox on one machine, the instrument on
+another — the far machine needs no MIDI hardware or backend):
+
+  # on the host with the instrument:
+  python jukebox.py --forward                  # relay TCP MIDI to it
+  # on the host driving it:
+  python jukebox.py --remote pi-host           # stream playback there
+
+The forwarder re-selects the instrument on every connection, so it
+can start before the instrument is powered on.
+
 Interactive commands: a number or `p N` plays; `s` stop, `n` next,
 `b` back, `a` autoplay, `l` loop, `t N` tempo %, `v N` volume 0-127,
 `x N` voice (GM program 0-127), `r` re-render, `?` help, `q` quit.
@@ -24,12 +35,15 @@ Requires mido, and python-rtmidi for real output ports.
 """
 import glob
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
 
 import mido
+
+DEFAULT_FORWARD_PORT = 13949
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIR = os.path.join(HERE, "examples")
@@ -84,6 +98,86 @@ def render_scores(src_dir, log=lambda s: None, force=False):
     return midis, errors
 
 
+# ── network transport ────────────────────────────────────────
+class NetworkOutput:
+    """A stand-in for a mido output port that streams each message as
+    raw MIDI bytes over TCP to a forwarder (see run_forwarder). Lets the
+    jukebox run on a machine with no MIDI hardware and play through an
+    instrument attached to another host — the forwarder just relays."""
+
+    def __init__(self, host, port):
+        self.sock = socket.create_connection((host, port), timeout=5)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.port_name = f"{host}:{port} (network forwarder)"
+
+    def send(self, msg):
+        try:
+            self.sock.sendall(bytes(msg.bytes()))
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def run_forwarder(bind_host, bind_port, piano_port=None):
+    """Relay MIDI bytes from a network client to a local instrument.
+    Re-selects the output on every new connection, so turning the
+    instrument on between sessions just works, and releases all notes
+    when a client disconnects."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((bind_host, bind_port))
+    srv.listen(1)
+    print(f"forwarder listening on {bind_host}:{bind_port} (Ctrl-C to stop)",
+          flush=True)
+    try:
+        while True:
+            conn, addr = srv.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            names = mido.get_output_names()
+            target = None
+            if piano_port:
+                target = next((n for n in names
+                               if piano_port.lower() in n.lower()), None)
+            if target is None:
+                target = Player._auto_select(names)
+            loop = "through" in target.lower()
+            print(f"client {addr[0]} -> {target}"
+                  + (" (loopback: silent)" if loop else ""), flush=True)
+            out = mido.open_output(target)
+            parser = mido.Parser()
+            count = 0
+            try:
+                while True:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    parser.feed(data)
+                    for msg in parser:
+                        out.send(msg)
+                        count += 1
+            except OSError:
+                pass
+            finally:
+                for ch in range(16):
+                    out.send(mido.Message("control_change", channel=ch,
+                                          control=64, value=0))
+                    out.send(mido.Message("control_change", channel=ch,
+                                          control=123, value=0))
+                out.close()
+                conn.close()
+                print(f"client {addr[0]} disconnected ({count} messages)",
+                      flush=True)
+    except KeyboardInterrupt:
+        print("\nforwarder stopped")
+    finally:
+        srv.close()
+
+
 # ── playback engine ──────────────────────────────────────────
 class Player:
     """Streams a MIDI file to an output port in a background thread,
@@ -92,24 +186,30 @@ class Player:
 
     HINTS = ("piano", "keyboard", "digital", "synth", "fluid", "usb")
 
-    def __init__(self, port=None, on_finish=None):
-        names = mido.get_output_names()
-        if not names:
-            raise RuntimeError("no MIDI output ports available "
-                               "(install python-rtmidi, or start a synth)")
-        if port:
-            match = next((n for n in names if port.lower() in n.lower()), None)
-            if match is None:
-                raise RuntimeError(f"no output matching {port!r}; "
-                                   f"available: {names}")
+    def __init__(self, port=None, on_finish=None, remote=None):
+        if remote is not None:
+            self.out = NetworkOutput(*remote)
+            self.port_name = self.out.port_name
         else:
-            match = self._auto_select(names)
-        self.port_name = match
-        if "through" in match.lower():
-            print(f"warning: playing to {match!r}, a MIDI loopback — no "
-                  f"sound unless a synth or instrument is chained to it. "
-                  f"Connect an instrument, or pass --port.", file=sys.stderr)
-        self.out = mido.open_output(match)
+            names = mido.get_output_names()
+            if not names:
+                raise RuntimeError("no MIDI output ports available "
+                                   "(install python-rtmidi, or start a synth)")
+            if port:
+                match = next((n for n in names
+                              if port.lower() in n.lower()), None)
+                if match is None:
+                    raise RuntimeError(f"no output matching {port!r}; "
+                                       f"available: {names}")
+            else:
+                match = self._auto_select(names)
+            self.port_name = match
+            if "through" in match.lower():
+                print(f"warning: playing to {match!r}, a MIDI loopback: "
+                      f"no sound unless a synth or instrument is chained to "
+                      f"it. Connect an instrument, or pass --port.",
+                      file=sys.stderr)
+            self.out = mido.open_output(match)
         self.on_finish = on_finish
         self.tempo_pct = 100
         self.volume = 100
@@ -214,12 +314,13 @@ class Player:
 
 # ── interactive console ──────────────────────────────────────
 class Jukebox:
-    def __init__(self, tracks, port=None):
+    def __init__(self, tracks, port=None, remote=None):
         self.tracks = tracks                      # [(title, path)]
         self.idx = -1
         self.autoplay = False
         self.loop = False
-        self.player = Player(port=port, on_finish=self._advance)
+        self.player = Player(port=port, on_finish=self._advance,
+                             remote=remote)
 
     def _advance(self):
         if self.loop and self.idx >= 0:
@@ -234,12 +335,12 @@ class Jukebox:
             return
         self.idx = i
         title, path = self.tracks[i]
-        print(f"\n♪  {title}")
+        print(f"\n> {title}")
         self.player.play(path, title)
 
     def print_list(self):
         for i, (title, _) in enumerate(self.tracks):
-            mark = "▶" if i == self.idx else " "
+            mark = ">" if i == self.idx else " "
             print(f"  {mark} {i + 1:2d}. {title}")
 
     HELP = ("commands: <n>/p<n> play  s stop  n next  b back  "
@@ -311,9 +412,16 @@ def build_tracks(src_dir, force=False):
     return [(pretty_title(m), m) for m in midis]
 
 
+def _parse_hostport(s, default_port):
+    host, _, p = s.partition(":")
+    return host, int(p) if p else default_port
+
+
 def main(argv):
     src_dir = DEFAULT_DIR
     port = None
+    remote = None
+    bind = ("0.0.0.0", DEFAULT_FORWARD_PORT)
     mode = "interactive"
     track_n = None
     i = 0
@@ -325,6 +433,14 @@ def main(argv):
         elif a == "--port":
             i += 1
             port = argv[i]
+        elif a == "--remote":
+            i += 1
+            remote = _parse_hostport(argv[i], DEFAULT_FORWARD_PORT)
+        elif a == "--bind":
+            i += 1
+            bind = _parse_hostport(argv[i], DEFAULT_FORWARD_PORT)
+        elif a == "--forward":
+            mode = "forward"
         elif a == "--list":
             mode = "list"
         elif a == "--all":
@@ -336,6 +452,10 @@ def main(argv):
             print(f"unknown argument {a!r}", file=sys.stderr)
             return 2
         i += 1
+
+    if mode == "forward":
+        run_forwarder(bind[0], bind[1], piano_port=port)
+        return 0
 
     if not os.path.isdir(src_dir):
         print(f"no such directory: {src_dir}", file=sys.stderr)
@@ -362,18 +482,24 @@ def main(argv):
             if state["k"] < len(order):
                 idx = order[state["k"]]
                 title, path = tracks[idx]
-                print(f"♪  {title}")
+                print(f"> {title}")
                 player.play(path, title)
             else:
                 done.set()
 
-        player = Player(port=port, on_finish=advance)
+        try:
+            player = Player(port=port, on_finish=advance, remote=remote)
+        except OSError as e:
+            print(f"could not reach forwarder at {remote[0]}:{remote[1]} "
+                  f"({e}); is 'jukebox.py --forward' running there?",
+                  file=sys.stderr)
+            return 1
         if not 0 <= order[0] < len(tracks):
             print(f"track out of range (1-{len(tracks)})", file=sys.stderr)
             return 2
         title, path = tracks[order[0]]
         print(f"port: {player.port_name}")
-        print(f"♪  {title}")
+        print(f"> {title}")
         player.play(path, title)
         try:
             while not done.wait(0.2):
@@ -386,7 +512,13 @@ def main(argv):
 
     # interactive, with re-render loop
     while True:
-        jb = Jukebox(tracks, port=port)
+        try:
+            jb = Jukebox(tracks, port=port, remote=remote)
+        except OSError as e:
+            print(f"could not reach forwarder at {remote[0]}:{remote[1]} "
+                  f"({e}); is 'jukebox.py --forward' running there?",
+                  file=sys.stderr)
+            return 1
         result = jb.run()
         if result == "rerender":
             tracks = build_tracks(src_dir, force=True)
