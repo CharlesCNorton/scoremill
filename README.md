@@ -244,6 +244,29 @@ widen it for synths with `Song(pitch_range=(0, 127))`.
 Running an example writes its `.mid` next to it; add `--play` to
 perform it on a connected MIDI output.
 
+## Jukebox
+
+`jukebox.py` plays a whole folder of scores on a MIDI output, with
+live tempo, volume, and voice control and a clean stop. It renders
+each script once (the same "running a script writes its `.mid`"
+contract, so a script that builds several songs contributes several
+tracks) and streams the results; there is no server and no external
+library, just the scores you point it at.
+
+```
+python jukebox.py                 # interactive, plays the examples
+python jukebox.py --list          # print the playlist and exit
+python jukebox.py --track 3       # play one track and exit
+python jukebox.py --all           # play the playlist in order
+python jukebox.py --dir myscores --port "FluidSynth"
+```
+
+Interactive: a number or `p N` plays; `s` stop, `n`/`b` next/back,
+`a` autoplay, `l` loop, `t N` tempo %, `v N` volume, `x N` voice
+(GM program), `r` re-render, `q` quit. It prefers a real instrument
+port and warns when only a MIDI loopback is available (which makes no
+sound). Requires `python-rtmidi` for output ports.
+
 ## License
 
 MIT.

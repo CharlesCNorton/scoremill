@@ -4,6 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import jukebox
 from scoremill import (CompositionError, Song, invert, rebar, retro,
                        shift, stretch)
 
@@ -251,6 +252,28 @@ def test_swing_sixteenth_unit():
     on_s = [t for (t, k, _, _, _) in straight.events() if k == "on"]
     on_w = [t for (t, k, _, _, _) in swung.events() if k == "on"]
     assert on_w[1] > on_s[1]      # the offbeat sixteenth is delayed
+
+
+def test_jukebox_tempo_factor():
+    assert jukebox.tempo_factor(100) == 1.0
+    assert jukebox.tempo_factor(200) == 2.0
+    assert jukebox.tempo_factor(50) == 0.5
+    assert jukebox.tempo_factor(5) == 0.1        # clamped floor
+    assert jukebox.tempo_factor(9000) == 4.0     # clamped ceiling
+
+
+def test_jukebox_pretty_title():
+    assert jukebox.pretty_title("a/b/silver_dollar_saloon.mid") == \
+        "Silver Dollar Saloon"
+    assert jukebox.pretty_title("player_piano_study_1.mid") == \
+        "Player Piano Study 1"
+
+
+def test_jukebox_port_selection():
+    pick = jukebox.Player._auto_select
+    assert pick(["Midi Through:0", "Digital Piano:1"]) == "Digital Piano:1"
+    assert pick(["Midi Through:0", "Some Device"]) == "Some Device"
+    assert pick(["Midi Through:0"]) == "Midi Through:0"   # loopback fallback
 
 
 def test_minor_key_signature():
