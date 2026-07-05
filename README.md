@@ -261,27 +261,33 @@ perform it on a connected MIDI output.
 
 ## Jukebox
 
-`jukebox.py` plays a whole folder of scores on a MIDI output, with
-live tempo, volume, and voice control and a clean stop. It renders
-each script once (the same "running a script writes its `.mid`"
+`jukebox.py` plays a whole folder of scores on a MIDI output. It
+renders each script once (the "running a script writes its `.mid`"
 contract, so a script that builds several songs contributes several
-tracks) and streams the results; there is no server and no external
-library, just the scores you point it at.
+tracks) and plays the results.
+
+With no flag it opens the GUI (tkinter): a searchable
+track list, play/stop/auto/loop, tempo/volume/voice, and a Local/Remote
+toggle that sends output to a port on this machine or, over the
+forwarder, to an instrument on another host. The rest are headless, for
+agents and automation:
 
 ```
-python jukebox.py                 # interactive, plays the examples
+python jukebox.py                 # GUI
 python jukebox.py --list          # print the playlist and exit
 python jukebox.py --track 3       # play one track and exit
 python jukebox.py --all           # play the playlist in order
 python jukebox.py --dir myscores --port "FluidSynth"
+python jukebox.py --library ~/midi  # a folder of MIDI files, not scripts
 ```
 
-Interactive: a number or `p N` plays; `s` stop, `n`/`b` next/back,
-`a` autoplay, `l` loop, `t N` tempo %, `v N` volume, `x N` voice
-(GM program), `r` re-render, `q` quit. It prefers a real instrument
-port and warns when only a MIDI loopback is available (which makes no
-sound). Requires `python-rtmidi` for output ports. Re-launching is
-instant, since scores already rendered are not rebuilt.
+A `--library DIR` source browses a directory of existing MIDI files
+instead of rendering scoremill scripts; its subfolders become named
+playlists (the GUI's Genre and Category menus).
+
+It prefers a real instrument port and warns when only a MIDI loopback
+is available (which makes no sound). Real output needs `python-rtmidi`.
+Re-launching is instant, since scores already rendered are not rebuilt.
 
 To play an instrument attached to another machine, run the jukebox on
 the far side too:

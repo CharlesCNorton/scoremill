@@ -1,37 +1,27 @@
 #!/usr/bin/env python3
-"""scoremill jukebox — play a folder of scoremill scores on a MIDI output.
+"""scoremill jukebox — play a folder of scoremill scores.
 
-A self-contained player for the example scores (or any directory of
-scoremill scripts). It renders each script to MIDI once, then streams
-the results to a MIDI output with live tempo, volume, and voice
-control and a clean stop. No network, no server, no external library:
-the playlist is whatever scoremill scripts you point it at.
+Renders each scoremill script to MIDI once, then plays the results to a
+MIDI output. With no flag it opens the GUI; the flags
+below are headless, for agents and automation.
 
-  python jukebox.py                 # interactive, plays examples/
+  python jukebox.py                 # GUI
   python jukebox.py --list          # print the playlist and exit
   python jukebox.py --track 3       # play one track to the end and exit
   python jukebox.py --all           # play the whole playlist in order
   python jukebox.py --dir myscores --port "FluidSynth"
 
-Network play (run the jukebox on one machine, the instrument on
-another — the far machine needs no MIDI hardware or backend):
+Network play (jukebox on one host, instrument on another; the far host
+needs no MIDI hardware or backend):
 
-  # on the host with the instrument:
-  python jukebox.py --forward                  # relay TCP MIDI to it
-  # on the host driving it:
-  python jukebox.py --remote pi-host           # stream playback there
+  python jukebox.py --forward       # on the host with the instrument
+  python jukebox.py --remote HOST   # stream playback there
 
-The forwarder re-selects the instrument on every connection, so it
-can start before the instrument is powered on.
-
-Interactive commands: a number or `p N` plays; `s` stop, `n` next,
-`b` back, `a` autoplay, `l` loop, `t N` tempo %, `v N` volume 0-127,
-`x N` voice (GM program 0-127), `r` re-render, `?` help, `q` quit.
-
-Rendering runs each script with the host Python; a scoremill script
-writes its .mid next to itself when run, so a script that builds
-several songs (player_piano_studies.py) contributes several tracks.
-Requires mido, and python-rtmidi for real output ports.
+The forwarder re-selects the instrument on each connection, so it can
+start before the instrument is powered on. Rendering runs each script
+with the host Python; a script writes its .mid next to itself, so one
+script may contribute several tracks. Requires mido, and python-rtmidi
+for real output ports.
 """
 import glob
 import os
@@ -47,13 +37,6 @@ DEFAULT_FORWARD_PORT = 13949
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIR = os.path.join(HERE, "examples")
-
-GM_VOICES = {
-    0: "Grand Piano", 1: "Bright Piano", 4: "Electric Piano",
-    6: "Harpsichord", 8: "Celesta", 10: "Music Box", 11: "Vibraphone",
-    19: "Church Organ", 24: "Nylon Guitar", 46: "Harp",
-    48: "Strings", 56: "Trumpet", 71: "Clarinet", 73: "Flute",
-}
 
 
 def tempo_factor(pct):
@@ -312,98 +295,6 @@ class Player:
         self.out.close()
 
 
-# ── interactive console ──────────────────────────────────────
-class Jukebox:
-    def __init__(self, tracks, port=None, remote=None):
-        self.tracks = tracks                      # [(title, path)]
-        self.idx = -1
-        self.autoplay = False
-        self.loop = False
-        self.player = Player(port=port, on_finish=self._advance,
-                             remote=remote)
-
-    def _advance(self):
-        if self.loop and self.idx >= 0:
-            self.start(self.idx)
-        elif self.autoplay and self.idx + 1 < len(self.tracks):
-            self.start(self.idx + 1)
-        else:
-            print("\n(finished)")
-
-    def start(self, i):
-        if not 0 <= i < len(self.tracks):
-            return
-        self.idx = i
-        title, path = self.tracks[i]
-        print(f"\n> {title}")
-        self.player.play(path, title)
-
-    def print_list(self):
-        for i, (title, _) in enumerate(self.tracks):
-            mark = ">" if i == self.idx else " "
-            print(f"  {mark} {i + 1:2d}. {title}")
-
-    HELP = ("commands: <n>/p<n> play  s stop  n next  b back  "
-            "a autoplay  l loop\n"
-            "          t<pct> tempo  v<0-127> volume  x<prog> voice  "
-            "r re-render  ? list  q quit")
-
-    def run(self):
-        print(f"scoremill jukebox  |  port: {self.player.port_name}  |  "
-              f"{len(self.tracks)} tracks")
-        self.print_list()
-        print(self.HELP)
-        try:
-            while True:
-                try:
-                    raw = input("jukebox> ").strip()
-                except EOFError:
-                    break
-                if not raw:
-                    continue
-                cmd, arg = raw[0].lower(), raw[1:].strip()
-                if raw.isdigit():
-                    self.start(int(raw) - 1)
-                elif cmd == "p" and arg.isdigit():
-                    self.start(int(arg) - 1)
-                elif cmd == "s":
-                    self.player.stop()
-                    print("(stopped)")
-                elif cmd == "n":
-                    self.start(self.idx + 1)
-                elif cmd == "b":
-                    self.start(self.idx - 1)
-                elif cmd == "a":
-                    self.autoplay = not self.autoplay
-                    print(f"autoplay {'on' if self.autoplay else 'off'}")
-                elif cmd == "l":
-                    self.loop = not self.loop
-                    print(f"loop {'on' if self.loop else 'off'}")
-                elif cmd == "t" and arg:
-                    self.player.set_tempo(arg)
-                    print(f"tempo {self.player.tempo_pct}%")
-                elif cmd == "v" and arg:
-                    self.player.set_volume(arg)
-                    print(f"volume {self.player.volume}")
-                elif cmd == "x" and arg.isdigit():
-                    self.player.set_voice(arg)
-                    name = GM_VOICES.get(self.player.voice, "program "
-                                         f"{self.player.voice}")
-                    print(f"voice: {name}")
-                elif cmd == "r":
-                    return "rerender"
-                elif cmd == "?":
-                    self.print_list()
-                    print(self.HELP)
-                elif cmd == "q":
-                    break
-                else:
-                    print(self.HELP)
-        finally:
-            self.player.close()
-        return None
-
-
 def build_tracks(src_dir, force=False):
     midis, errors = render_scores(
         src_dir, log=lambda s: print(s, file=sys.stderr), force=force)
@@ -412,17 +303,535 @@ def build_tracks(src_dir, force=False):
     return [(pretty_title(m), m) for m in midis]
 
 
+def scan_library(root):
+    """Grouped tracks from a directory of existing MIDI files:
+    [(group, sub, title, path)]. The first folder under `root` is the
+    group, the second the sub-playlist; files directly in `root` group
+    under ''. No rendering, just a walk."""
+    root = os.path.abspath(root)
+    tracks = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        rel = os.path.relpath(dirpath, root)
+        parts = [] if rel == os.curdir else rel.split(os.sep)
+        group = parts[0] if parts else ""
+        sub = parts[1] if len(parts) > 1 else ""
+        for fn in sorted(filenames):
+            if fn.lower().endswith((".mid", ".midi")):
+                tracks.append((group, sub, pretty_title(fn),
+                               os.path.join(dirpath, fn)))
+    return tracks
+
+
 def _parse_hostport(s, default_port):
     host, _, p = s.partition(":")
     return host, int(p) if p else default_port
+
+
+# ── GUI (tkinter; imported lazily when the window opens) ──────
+BG, BG2, BG3 = "#1e1e2e", "#282840", "#313150"
+FG, DIM, ACCENT = "#e0e0e0", "#888899", "#3b5998"
+GREEN, RED, YELLOW = "#4ecca3", "#e94560", "#ffd700"
+
+# General-MIDI voices offered in the Voice picker (program, label).
+VOICES = [
+    (0, "Grand Piano"), (1, "Bright Piano"), (2, "Electric Grand"),
+    (4, "Electric Piano 1"), (5, "Electric Piano 2"), (6, "Harpsichord"),
+    (7, "Clavinet"), (8, "Celesta"), (10, "Music Box"), (11, "Vibraphone"),
+    (13, "Xylophone"), (16, "Drawbar Organ"), (19, "Church Organ"),
+    (21, "Accordion"), (24, "Nylon Guitar"), (25, "Steel Guitar"),
+    (40, "Violin"), (42, "Cello"), (46, "Orchestral Harp"),
+    (48, "String Ensemble"), (56, "Trumpet"), (68, "Oboe"),
+    (71, "Clarinet"), (73, "Flute"), (80, "Synth Lead"), (88, "Synth Pad"),
+]
+
+
+def _midi_seconds(path):
+    """Base duration of a MIDI file in seconds, or 0.0 if unreadable."""
+    try:
+        return mido.MidiFile(path).length
+    except Exception:
+        return 0.0
+
+
+class ScoremillJukebox:
+    def __init__(self, src_dir, local_port=None, remote=None, library=None):
+        import tkinter as tk
+        from tkinter import ttk
+        self.tk, self.ttk = tk, ttk
+
+        self.src_dir = src_dir
+        self.library = library    # a MIDI directory to browse, or None (scripts)
+        self.grouped = []         # [(group, sub, title, path)]
+        self._visible = []        # [(title, path)] after filters
+        self.player = None
+        self._player_key = None   # marks which target the live player serves
+        self.playing_path = None
+
+        self.root = tk.Tk()
+        self.root.title("Scoremill Jukebox")
+        self.root.geometry("560x780")
+        self.root.configure(bg=BG)
+        self.root.minsize(440, 680)
+
+        self.mode = tk.StringVar(value="remote" if remote else "local")
+        self.local_port = tk.StringVar(value=local_port or "Auto")
+        self.remote_host = tk.StringVar(value=(remote[0] if remote else ""))
+        self.remote_port = tk.StringVar(
+            value=str(remote[1] if remote else DEFAULT_FORWARD_PORT))
+
+        self.genre = tk.StringVar(value="All")
+        self.sub = tk.StringVar(value="All")
+        self.search = tk.StringVar()
+        self.now_playing = tk.StringVar(value="Nothing playing")
+        self.status = tk.StringVar(value="Rendering scores...")
+        self.duration = tk.StringVar(value="")
+        self.count = tk.StringVar(value="")
+        self.tempo = tk.IntVar(value=100)
+        self.volume = tk.IntVar(value=100)
+        self.voice = tk.StringVar(value="Grand Piano")
+        self.autoplay = tk.BooleanVar(value=False)
+        self.loop = tk.BooleanVar(value=False)
+        self._tempo_job = self._vol_job = None
+
+        self._build_ui()
+        self.search.trace_add("write", lambda *_: self._filter())
+        self.root.after(50, lambda: self._render(force=False))
+
+    # ── UI ───────────────────────────────────────────────────
+    def _build_ui(self):
+        tk, ttk = self.tk, self.ttk
+
+        top = tk.Frame(self.root, bg=BG)
+        top.pack(fill="x", padx=20, pady=(14, 0))
+        tk.Label(top, text="Scoremill Jukebox", bg=BG, fg=FG,
+                 font=("Segoe UI", 18, "bold")).pack(side="left")
+        self.status_lbl = tk.Label(top, textvariable=self.status, bg=BG,
+                                   fg=DIM, font=("Segoe UI", 9))
+        self.status_lbl.pack(side="right", pady=(6, 0))
+
+        # Output target
+        trow = tk.Frame(self.root, bg=BG)
+        trow.pack(fill="x", padx=20, pady=(12, 0))
+        tk.Label(trow, text="Output", bg=BG, fg=DIM,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        radios = tk.Frame(trow, bg=BG)
+        radios.pack(fill="x")
+        for label, val in (("Local synth", "local"), ("Remote (network)", "remote")):
+            tk.Radiobutton(
+                radios, text=label, value=val, variable=self.mode,
+                command=self._on_target, bg=BG, fg=FG, selectcolor=BG3,
+                activebackground=BG, activeforeground=FG,
+                font=("Segoe UI", 10)).pack(side="left", padx=(0, 12))
+
+        self.local_frame = tk.Frame(self.root, bg=BG)
+        self.local_combo = ttk.Combobox(
+            self.local_frame, textvariable=self.local_port,
+            values=["Auto"], state="readonly", width=28)
+        self.local_combo.pack(side="left")
+        self.local_combo.bind("<<ComboboxSelected>>", lambda _: self._invalidate())
+
+        self.remote_frame = tk.Frame(self.root, bg=BG)
+        tk.Label(self.remote_frame, text="Host", bg=BG, fg=DIM,
+                 font=("Segoe UI", 9)).pack(side="left")
+        e1 = tk.Entry(self.remote_frame, textvariable=self.remote_host, width=16,
+                      bg=BG2, fg=FG, insertbackground=FG, relief="flat", bd=4)
+        e1.pack(side="left", padx=(4, 10))
+        tk.Label(self.remote_frame, text="Port", bg=BG, fg=DIM,
+                 font=("Segoe UI", 9)).pack(side="left")
+        e2 = tk.Entry(self.remote_frame, textvariable=self.remote_port, width=7,
+                      bg=BG2, fg=FG, insertbackground=FG, relief="flat", bd=4)
+        e2.pack(side="left", padx=(4, 0))
+        for e in (e1, e2):
+            e.bind("<FocusOut>", lambda _: self._invalidate())
+            e.bind("<Return>", lambda _: self._invalidate())
+
+        self.target_holder = tk.Frame(self.root, bg=BG)
+        self.target_holder.pack(fill="x", padx=20, pady=(6, 0))
+        self._on_target()
+
+        # Playlists (folders of a --library; blank for scoremill scripts)
+        grow = tk.Frame(self.root, bg=BG)
+        grow.pack(fill="x", padx=20, pady=(10, 0))
+        tk.Label(grow, text="Genre", bg=BG, fg=DIM,
+                 font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
+        tk.Label(grow, text="Category", bg=BG, fg=DIM,
+                 font=("Segoe UI", 9)).grid(row=0, column=1, sticky="w", padx=(14, 0))
+        self.genre_combo = ttk.Combobox(grow, textvariable=self.genre,
+                                        values=["All"], state="readonly", width=16)
+        self.genre_combo.grid(row=1, column=0, sticky="w")
+        self.genre_combo.bind("<<ComboboxSelected>>", self._on_genre)
+        self.sub_combo = ttk.Combobox(grow, textvariable=self.sub,
+                                      values=["All"], state="readonly", width=22)
+        self.sub_combo.grid(row=1, column=1, sticky="ew", padx=(14, 0))
+        self.sub_combo.bind("<<ComboboxSelected>>", lambda _: self._filter())
+        grow.columnconfigure(1, weight=1)
+
+        # Search
+        srow = tk.Frame(self.root, bg=BG)
+        srow.pack(fill="x", padx=20, pady=(10, 0))
+        tk.Label(srow, text="Search", bg=BG, fg=DIM,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Entry(srow, textvariable=self.search, bg=BG2, fg=FG,
+                 insertbackground=FG, font=("Segoe UI", 11), relief="flat",
+                 bd=4).pack(fill="x")
+
+        # Song list
+        lf = tk.Frame(self.root, bg=BG3)
+        lf.pack(fill="both", expand=True, padx=20, pady=(10, 0))
+        self.listbox = tk.Listbox(
+            lf, bg=BG2, fg=FG, selectbackground=ACCENT, selectforeground="white",
+            font=("Segoe UI", 11), relief="flat", bd=0, highlightthickness=0,
+            activestyle="none", exportselection=False)
+        sb = tk.Scrollbar(lf, orient="vertical", command=self.listbox.yview,
+                          bg=BG2, troughcolor=BG2, bd=0)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=2)
+        sb.pack(side="right", fill="y", pady=2, padx=(0, 2))
+        self.listbox.bind("<Double-Button-1>", lambda _: self._play())
+        self.listbox.bind("<Return>", lambda _: self._play())
+
+        crow = tk.Frame(self.root, bg=BG)
+        crow.pack(fill="x", padx=20, pady=(2, 0))
+        tk.Label(crow, textvariable=self.count, bg=BG, fg=DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(2, 0))
+        self.rerender_btn = tk.Button(
+            crow, text="↻  Re-render", command=lambda: self._render(force=True),
+            bg=BG3, fg=FG, activebackground=BG2, font=("Segoe UI", 9),
+            relief="flat", padx=8, pady=1, cursor="hand2")
+        self.rerender_btn.pack(side="right")
+
+        # Now playing
+        np = tk.Frame(self.root, bg=BG)
+        np.pack(fill="x", padx=20, pady=(8, 0))
+        tk.Label(np, text="♪", bg=BG, fg=GREEN,
+                 font=("Segoe UI", 14)).pack(side="left")
+        tk.Label(np, textvariable=self.now_playing, bg=BG, fg=GREEN,
+                 font=("Segoe UI", 12, "bold")).pack(side="left", padx=(6, 0))
+        tk.Label(np, textvariable=self.duration, bg=BG, fg=DIM,
+                 font=("Segoe UI", 10)).pack(side="right")
+
+        # Transport buttons
+        bf = tk.Frame(self.root, bg=BG)
+        bf.pack(fill="x", padx=20, pady=(12, 0))
+        self.play_btn = tk.Button(
+            bf, text="▶  Play", command=self._play, bg=GREEN, fg="#1a1a2e",
+            activebackground="#3dbb92", font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=24, pady=7, cursor="hand2")
+        self.play_btn.pack(side="left")
+        tk.Button(bf, text="■  Stop", command=self._stop, bg=RED, fg="white",
+                  activebackground="#d03050", font=("Segoe UI", 12, "bold"),
+                  relief="flat", padx=24, pady=7, cursor="hand2").pack(
+                      side="left", padx=(12, 0))
+        self.auto_btn = tk.Button(
+            bf, text="↻  Auto", command=self._toggle_auto, bg=BG3, fg=FG,
+            activebackground=BG2, font=("Segoe UI", 11), relief="flat",
+            padx=14, pady=7, cursor="hand2")
+        self.auto_btn.pack(side="left", padx=(16, 0))
+        self.loop_btn = tk.Button(
+            bf, text="⟳  Loop", command=self._toggle_loop, bg=BG3, fg=FG,
+            activebackground=BG2, font=("Segoe UI", 11), relief="flat",
+            padx=14, pady=7, cursor="hand2")
+        self.loop_btn.pack(side="left", padx=(8, 0))
+
+        # Tempo
+        tf = tk.Frame(self.root, bg=BG)
+        tf.pack(fill="x", padx=20, pady=(12, 0))
+        tk.Label(tf, text="Tempo", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w")
+        tr = tk.Frame(tf, bg=BG)
+        tr.pack(fill="x")
+        tk.Scale(tr, from_=50, to=200, orient="horizontal", variable=self.tempo,
+                 command=self._on_tempo, bg=BG, fg=FG, troughcolor=BG2,
+                 highlightthickness=0, sliderrelief="flat", showvalue=False,
+                 sliderlength=20).pack(side="left", fill="x", expand=True)
+        self.tempo_lbl = tk.Label(tr, text="100%", bg=BG, fg=FG,
+                                  font=("Segoe UI", 11, "bold"), width=5)
+        self.tempo_lbl.pack(side="left", padx=(6, 0))
+
+        # Volume
+        vf = tk.Frame(self.root, bg=BG)
+        vf.pack(fill="x", padx=20, pady=(10, 0))
+        tk.Label(vf, text="Volume", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w")
+        vr = tk.Frame(vf, bg=BG)
+        vr.pack(fill="x")
+        tk.Scale(vr, from_=0, to=127, orient="horizontal", variable=self.volume,
+                 command=self._on_volume, bg=BG, fg=FG, troughcolor=BG2,
+                 highlightthickness=0, sliderrelief="flat", showvalue=False,
+                 sliderlength=20).pack(side="left", fill="x", expand=True)
+        self.vol_lbl = tk.Label(vr, text="100", bg=BG, fg=FG,
+                                font=("Segoe UI", 11, "bold"), width=4)
+        self.vol_lbl.pack(side="left", padx=(6, 0))
+
+        # Voice
+        vcf = tk.Frame(self.root, bg=BG)
+        vcf.pack(fill="x", padx=20, pady=(10, 0))
+        tk.Label(vcf, text="Voice", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w")
+        vc = ttk.Combobox(vcf, textvariable=self.voice,
+                          values=[n for _, n in VOICES], state="readonly", width=22)
+        vc.pack(anchor="w")
+        vc.bind("<<ComboboxSelected>>", self._on_voice)
+
+        tk.Frame(self.root, bg=BG, height=14).pack(fill="x")
+        self.root.bind("<Escape>", lambda _: self._stop())
+
+    # ── target selection ─────────────────────────────────────
+    def _on_target(self):
+        self.local_frame.pack_forget()
+        self.remote_frame.pack_forget()
+        frame = self.local_frame if self.mode.get() == "local" else self.remote_frame
+        frame.pack(in_=self.target_holder, anchor="w")
+        if self.mode.get() == "local":
+            self._refresh_local_ports()
+        self._invalidate()
+
+    def _refresh_local_ports(self):
+        try:
+            names = mido.get_output_names()
+        except Exception:
+            names = []
+        self.local_combo.configure(values=["Auto"] + names)
+        if self.local_port.get() not in (["Auto"] + names):
+            self.local_port.set("Auto")
+
+    def _invalidate(self):
+        """Drop the live player so the next Play rebinds to the current
+        target. A playing track is stopped first."""
+        if self.player is not None:
+            try:
+                self.player.close()
+            except Exception:
+                pass
+        self.player = None
+        self._player_key = None
+
+    def _target_key(self):
+        if self.mode.get() == "local":
+            return ("local", self.local_port.get())
+        return ("remote", self.remote_host.get().strip(),
+                self.remote_port.get().strip())
+
+    def _ensure_player(self):
+        """Return a Player bound to the current target, creating it on
+        first use or after a target change. Returns None and sets the
+        status on failure (no MIDI port, forwarder unreachable, ...)."""
+        key = self._target_key()
+        if self.player is not None and self._player_key == key:
+            return self.player
+        if self.player is not None:
+            try:
+                self.player.close()
+            except Exception:
+                pass
+            self.player = None
+        try:
+            if self.mode.get() == "local":
+                name = self.local_port.get()
+                port = None if name in ("", "Auto") else name
+                p = Player(port=port, on_finish=self._finish)
+            else:
+                host = self.remote_host.get().strip()
+                if not host:
+                    self.status.set("Remote: enter a host")
+                    return None
+                try:
+                    rport = int(self.remote_port.get())
+                except ValueError:
+                    rport = DEFAULT_FORWARD_PORT
+                p = Player(remote=(host, rport), on_finish=self._finish)
+        except Exception as e:
+            self.status.set(f"Output error: {e}")
+            self.status_lbl.config(fg=RED)
+            return None
+        p.set_tempo(self.tempo.get())
+        p.set_volume(self.volume.get())
+        p.set_voice(self._voice_program())
+        self.player = p
+        self._player_key = key
+        self.status.set(f"● {p.port_name}")
+        self.status_lbl.config(fg=DIM)
+        return p
+
+    # ── rendering ────────────────────────────────────────────
+    def _render(self, force):
+        self.status.set("Scanning library..." if self.library
+                        else "Rendering scores...")
+        self.rerender_btn.config(state="disabled")
+
+        def work():
+            try:
+                if self.library:
+                    grouped = scan_library(self.library)
+                else:
+                    grouped = [("", "", t, p) for t, p
+                               in build_tracks(self.src_dir, force=force)]
+            except Exception as e:
+                self.root.after(0, lambda: self.status.set(f"Load failed: {e}"))
+                self.root.after(0, lambda: self.rerender_btn.config(state="normal"))
+                return
+            self.root.after(0, lambda: self._loaded(grouped))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _loaded(self, grouped):
+        self.grouped = grouped
+        groups = sorted({g for g, _s, _t, _p in grouped if g})
+        self.genre_combo.configure(values=["All"] + groups)
+        self._update_subs()
+        self.rerender_btn.config(state="normal")
+        self._filter()
+        if self.mode.get() == "local":
+            self._refresh_local_ports()
+        self.status.set(f"● {len(grouped)} tracks ready")
+
+    # ── list + filter ────────────────────────────────────────
+    def _on_genre(self, _e=None):
+        self.sub.set("All")
+        self._update_subs()
+        self._filter()
+
+    def _update_subs(self):
+        genre = self.genre.get()
+        subs = sorted({s for g, s, _t, _p in self.grouped
+                       if s and (genre == "All" or g == genre)})
+        self.sub_combo.configure(values=["All"] + subs)
+        if self.sub.get() not in (["All"] + subs):
+            self.sub.set("All")
+
+    def _filter(self):
+        genre, sub = self.genre.get(), self.sub.get()
+        q = self.search.get().lower()
+        self.listbox.delete(0, "end")
+        self._visible = []
+        for g, s, title, path in self.grouped:
+            if genre != "All" and g != genre:
+                continue
+            if sub != "All" and s != sub:
+                continue
+            if q and q not in title.lower():
+                continue
+            self.listbox.insert("end", title)
+            self._visible.append((title, path))
+        self.count.set(f"{len(self._visible)} tracks")
+
+    # ── transport ────────────────────────────────────────────
+    def _play(self):
+        sel = self.listbox.curselection()
+        if not sel or not self._visible:
+            return
+        title, path = self._visible[sel[0]]
+        p = self._ensure_player()
+        if p is None:
+            return
+        self.playing_path = path
+        p.play(path, title)
+        self.now_playing.set(title)
+        secs = _midi_seconds(path)
+        self.duration.set(f"{int(secs // 60)}m {int(secs % 60)}s" if secs else "")
+        self.status.set("● Playing")
+        self.status_lbl.config(fg=GREEN)
+
+    def _stop(self):
+        if self.player is not None:
+            self.player.stop()
+        self.now_playing.set("Stopped")
+        self.duration.set("")
+        self.status.set("● Ready")
+        self.status_lbl.config(fg=DIM)
+
+    def _finish(self):
+        """Player thread signals a natural end; hop to the tk thread."""
+        self.root.after(0, self._advance)
+
+    def _advance(self):
+        if self.loop.get() and self.playing_path:
+            self._play_path(self.playing_path)
+            return
+        if self.autoplay.get():
+            for i, (_, path) in enumerate(self._visible):
+                if path == self.playing_path and i + 1 < len(self._visible):
+                    self.listbox.selection_clear(0, "end")
+                    self.listbox.selection_set(i + 1)
+                    self.listbox.see(i + 1)
+                    self._play()
+                    return
+        self.now_playing.set("Finished")
+        self.duration.set("")
+        self.status.set("● Ready")
+        self.status_lbl.config(fg=DIM)
+
+    def _play_path(self, path):
+        p = self._ensure_player()
+        if p is None:
+            return
+        title = next((t for t, pp in self._visible if pp == path),
+                     pretty_title(path))
+        self.playing_path = path
+        p.play(path, title)
+        self.now_playing.set(title)
+
+    def _toggle_auto(self):
+        self.autoplay.set(not self.autoplay.get())
+        on = self.autoplay.get()
+        self.auto_btn.config(bg=YELLOW if on else BG3, fg="#1a1a2e" if on else FG)
+
+    def _toggle_loop(self):
+        self.loop.set(not self.loop.get())
+        on = self.loop.get()
+        self.loop_btn.config(bg=GREEN if on else BG3, fg="#1a1a2e" if on else FG)
+
+    def _on_tempo(self, val):
+        v = int(float(val))
+        self.tempo_lbl.config(text=f"{v}%")
+        if self._tempo_job:
+            self.root.after_cancel(self._tempo_job)
+        self._tempo_job = self.root.after(
+            60, lambda: self.player and self.player.set_tempo(v))
+
+    def _on_volume(self, val):
+        v = int(float(val))
+        self.vol_lbl.config(text=str(v))
+        if self._vol_job:
+            self.root.after_cancel(self._vol_job)
+        self._vol_job = self.root.after(
+            60, lambda: self.player and self.player.set_volume(v))
+
+    def _voice_program(self):
+        name = self.voice.get()
+        return next((prog for prog, n in VOICES if n == name), 0)
+
+    def _on_voice(self, _e=None):
+        if self.player:
+            self.player.set_voice(self._voice_program())
+
+    # ── lifecycle ────────────────────────────────────────────
+    def _on_close(self):
+        if self.player is not None:
+            try:
+                self.player.close()
+            except Exception:
+                pass
+        self.root.destroy()
+
+    def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.mainloop()
+
+
+def launch(src_dir, local_port=None, remote=None, library=None):
+    """Open the jukebox GUI. With `library` set, browse that directory of
+    existing MIDI files (subfolders as named playlists); otherwise render
+    and play the scoremill scripts in `src_dir`."""
+    ScoremillJukebox(src_dir, local_port=local_port, remote=remote,
+                     library=library).run()
 
 
 def main(argv):
     src_dir = DEFAULT_DIR
     port = None
     remote = None
+    library = None
     bind = ("0.0.0.0", DEFAULT_FORWARD_PORT)
-    mode = "interactive"
+    mode = "gui"
     track_n = None
     i = 0
     while i < len(argv):
@@ -430,6 +839,9 @@ def main(argv):
         if a == "--dir":
             i += 1
             src_dir = argv[i]
+        elif a == "--library":
+            i += 1
+            library = argv[i]
         elif a == "--port":
             i += 1
             port = argv[i]
@@ -457,13 +869,19 @@ def main(argv):
         run_forwarder(bind[0], bind[1], piano_port=port)
         return 0
 
-    if not os.path.isdir(src_dir):
-        print(f"no such directory: {src_dir}", file=sys.stderr)
+    source = library if library else src_dir
+    if not os.path.isdir(source):
+        print(f"no such directory: {source}", file=sys.stderr)
         return 2
 
-    tracks = build_tracks(src_dir)
+    if mode == "gui":
+        launch(src_dir, local_port=port, remote=remote, library=library)
+        return 0
+
+    tracks = ([(t, p) for (_g, _s, t, p) in scan_library(library)] if library
+              else build_tracks(src_dir))
     if not tracks:
-        print(f"no scores found in {src_dir}", file=sys.stderr)
+        print(f"no tracks in {source}", file=sys.stderr)
         return 1
 
     if mode == "list":
@@ -510,20 +928,6 @@ def main(argv):
             player.close()
         return 0
 
-    # interactive, with re-render loop
-    while True:
-        try:
-            jb = Jukebox(tracks, port=port, remote=remote)
-        except OSError as e:
-            print(f"could not reach forwarder at {remote[0]}:{remote[1]} "
-                  f"({e}); is 'jukebox.py --forward' running there?",
-                  file=sys.stderr)
-            return 1
-        result = jb.run()
-        if result == "rerender":
-            tracks = build_tracks(src_dir, force=True)
-            continue
-        break
     return 0
 
 
