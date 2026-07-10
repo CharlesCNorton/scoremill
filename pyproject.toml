@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scoremill"
-version = "0.2.0"
+version = "0.3.0"
 description = "Text-notation MIDI composition library designed for language-model agents"
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,6 +19,10 @@ classifiers = [
 
 [project.optional-dependencies]
 play = ["python-rtmidi>=1.5"]
+
+[project.urls]
+Homepage = "https://github.com/CharlesCNorton/scoremill"
+Issues = "https://github.com/CharlesCNorton/scoremill/issues"
 
 [tool.setuptools]
 py-modules = ["scoremill"]

@@ -431,6 +431,209 @@ def test_lint_detects_parallel_fifths():
     assert any("parallel fifths" in f for f in findings)
 
 
+def test_retro_reverses_tuplet_members():
+    assert retro("{c4 d4 e4}q f4q") == "f4q {e4 d4 c4}q"
+
+
+def test_retro_keeps_grace_attached():
+    assert retro("+d5 c5q e5q") == "e5q +d5 c5q"
+
+
+def test_retro_writes_sticky_state_explicitly():
+    assert retro("c5q d e") == "e5q d5q c5q"          # octaves explicit
+    assert retro("c4e {d4 e4 f4} g4q") == "g4q {f4 e4 d4}e c4e"
+    assert retro("c4q d4'") == "d4q' c4q"             # dur before marks
+
+
+def test_chord_member_duration_rejected():
+    try:
+        Song().section("CM").voice("m").bars("[c4q e4]h [c4 e4]h |")
+        raise AssertionError("member duration check did not fire")
+    except CompositionError as e:
+        assert "after the ']'" in str(e)
+
+
+def test_chord_member_mark_rejected():
+    try:
+        Song().section("CM").voice("m").bars("[c4> e4]h [c4 e4]h |")
+        raise AssertionError("member mark check did not fire")
+    except CompositionError as e:
+        assert "marks" in str(e)
+
+
+def test_tuplet_member_mark_rejected():
+    try:
+        Song().section("TM").voice("m").bars("{c4> d4 e4}q c4q c4h |")
+        raise AssertionError("tuplet member mark check did not fire")
+    except CompositionError as e:
+        assert "tie" in str(e)
+
+
+def test_trill_too_short_rejected():
+    try:
+        Song().section("TR").voice("m").bars("c4s% c4s c4e c4q c4h |")
+        raise AssertionError("trill length check did not fire")
+    except CompositionError as e:
+        assert "trill" in str(e)
+
+
+def test_trill_alternates_without_stutter():
+    song = Song(humanize=0, expressive=False)
+    song.section("T").voice("m").bars("c4h% c4h |")
+    song.arrange("T")
+    trill = [n.pitches[0] for n in song.sections["T"].voices[0].notes][:-1]
+    assert 62 in trill                    # the upper neighbor sounds
+    assert all(a != b for a, b in zip(trill, trill[1:]))   # no repeat
+
+
+def test_harmony_range_guard():
+    try:
+        Song().section("HR").voice("m").harmony("C", style="stride",
+                                                octave=1)
+        raise AssertionError("harmony range check did not fire")
+    except CompositionError as e:
+        assert "range" in str(e)
+
+
+def test_unknown_section_reported():
+    song = Song()
+    song.section("A").voice("m").bars("c4w |")
+    song.arrange("A")
+    try:
+        song.events(order=["Nope"])
+        raise AssertionError("unknown section check did not fire")
+    except CompositionError as e:
+        assert "Nope" in str(e)
+
+
+def test_duplicate_section_rejected():
+    song = Song()
+    song.section("A")
+    try:
+        song.section("A")
+        raise AssertionError("duplicate section check did not fire")
+    except CompositionError as e:
+        assert "already exists" in str(e)
+
+
+def test_harmony_slots_validated():
+    try:
+        Song().section("SL").voice("m").harmony("C G", slots="quarter")
+        raise AssertionError("slots check did not fire")
+    except CompositionError as e:
+        assert "slots" in str(e)
+
+
+def test_grace_needs_following_strike():
+    song = Song()
+    song.section("G1").voice("m").bars("c4h. e4q +g4 |")
+    try:
+        song.report()
+        raise AssertionError("trailing grace check did not fire")
+    except CompositionError as e:
+        assert "grace" in str(e)
+    song2 = Song()
+    song2.section("G2").voice("m").bars("c4q +d4 rq e4h |")
+    try:
+        song2.report()
+        raise AssertionError("grace-before-rest check did not fire")
+    except CompositionError as e:
+        assert "rest" in str(e)
+
+
+def test_grace_duration_rejected():
+    try:
+        Song().section("GD").voice("m").bars("+d5q c5q c5q c5h |")
+        raise AssertionError("grace duration check did not fire")
+    except CompositionError as e:
+        assert "duration" in str(e)
+
+
+def test_tie_accepts_reordered_chord():
+    song = Song()
+    song.section("TC").voice("m").bars("[c4 e4]h~ [e4 c4]h |")
+    song.arrange("TC")
+    song.report()                         # must not raise
+    ons = [e for e in song.events() if e[1] == "on"]
+    assert len(ons) == 2                  # tie carries: one strike per pitch
+
+
+def test_double_cresc_rejected():
+    try:
+        Song().section("DC").voice("m").bars(
+            "cresc c4q dim d4q !f e4q f4q |")
+        raise AssertionError("double cresc check did not fire")
+    except CompositionError as e:
+        assert "still open" in str(e)
+
+
+def test_render_stamp_skips_and_rerenders():
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        script = os.path.join(d, "one.py")
+        with open(script, "w") as fh:
+            fh.write("open('one.mid','wb').write(b'x')\n"
+                     "open('count.txt','a').write('.')\n")
+
+        def runs():
+            with open(os.path.join(d, "count.txt")) as fh:
+                return len(fh.read())
+
+        midis, errors = jukebox.render_scores(d)
+        assert midis and not errors and runs() == 1
+        jukebox.render_scores(d)              # unchanged: not re-run
+        assert runs() == 1
+        mtime = os.path.getmtime(script)
+        os.utime(script, (mtime + 2, mtime + 2))
+        jukebox.render_scores(d)              # edited: re-run
+        assert runs() == 2
+        jukebox.render_scores(d, force=True)  # forced: re-run
+        assert runs() == 3
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_forwarder_survives_port_failures():
+    import random
+    import socket
+    import threading
+    import time
+    real_get = jukebox.mido.get_output_names
+    real_open = jukebox.mido.open_output
+    calls = {"n": 0}
+
+    def fake_get():
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else ["Fake Piano"]
+
+    def fake_open(name):
+        raise RuntimeError("port busy")
+
+    jukebox.mido.get_output_names = fake_get
+    jukebox.mido.open_output = fake_open
+    try:
+        started = None
+        for _ in range(5):                    # find a free port
+            port = random.randint(21000, 39000)
+            th = threading.Thread(target=jukebox.run_forwarder,
+                                  args=("127.0.0.1", port), daemon=True)
+            th.start()
+            time.sleep(0.3)
+            if th.is_alive():
+                started = port
+                break
+        assert started, "forwarder never started"
+        for _ in range(3):    # no-ports, then open-failure, then again:
+            c = socket.create_connection(("127.0.0.1", started), timeout=5)
+            c.close()         # each failure must leave the daemon alive
+            time.sleep(0.3)
+    finally:
+        jukebox.mido.get_output_names = real_get
+        jukebox.mido.open_output = real_open
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

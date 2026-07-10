@@ -52,12 +52,12 @@ python examples/saltarello_alla_chico.py --play   # performs it
 ## Install
 
 ```
-pip install mido            # rendering to .mid files
-pip install python-rtmidi   # optional: real-time playback ports
+pip install scoremill           # library (pulls mido)
+pip install scoremill[play]     # + python-rtmidi for real-time ports
 ```
 
-Then copy `scoremill.py` into your project, or `pip install -e .` from
-a clone.
+Or copy `scoremill.py` into your project — it is a single file — or
+`pip install -e .` from a clone.
 
 ## Sixty seconds
 
@@ -121,7 +121,10 @@ rebar(frag, 3)              # re-insert barlines every 3 beats
 Explicit alterations travel with their scale degree under `shift` and
 are mirrored under `invert` (a raised degree inverts to a lowered
 one). `retro` insists the fragment contain no barlines, dynamics, or
-ties; apply those around the result. `stretch` changes durations and
+ties; apply those around the result. A grace note travels with the
+note it ornaments, tuplet members reverse within their tuplet, and
+sticky octaves and durations are written out first so the reversal
+cannot change what a token means. `stretch` changes durations and
 therefore the barring, so pair it with `rebar`, which re-inserts
 barlines at a chosen bar length and errors if a note would straddle
 one.

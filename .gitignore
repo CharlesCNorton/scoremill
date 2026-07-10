@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.mid
+.render_stamp.json
 dist/
 build/
 *.egg-info/

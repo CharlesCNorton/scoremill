@@ -24,6 +24,7 @@ script may contribute several tracks. Requires mido, and python-rtmidi
 for real output ports.
 """
 import glob
+import json
 import os
 import socket
 import subprocess
@@ -59,24 +60,42 @@ def render_scores(src_dir, log=lambda s: None, force=False):
     """Run each *.py in src_dir so it writes its MIDI (the scoremill
     contract), then return the sorted list of .mid files present.
     Rendering is idempotent: a script simply overwrites its own output,
-    and one script may write several files. A script is skipped when
-    the directory already holds MIDI at least as new as it, so a
-    repeat launch with nothing edited renders nothing; pass force=True
-    to render regardless. Returns (midi_paths, errors)."""
+    and one script may write several files. A stamp file remembers each
+    script's mtime at its last render, so a repeat launch with nothing
+    edited renders nothing; pass force=True to render regardless.
+    Returns (midi_paths, errors)."""
     errors = []
-    existing = glob.glob(os.path.join(src_dir, "*.mid"))
-    newest = max((os.path.getmtime(m) for m in existing), default=-1.0)
-    for script in sorted(glob.glob(os.path.join(src_dir, "*.py"))):
-        if not force and newest >= os.path.getmtime(script):
-            continue                    # a render newer than this script exists
-        log(f"rendering {os.path.basename(script)} ...")
+    stamp_path = os.path.join(src_dir, ".render_stamp.json")
+    stamps = {}
+    if not force:
+        try:
+            with open(stamp_path, "r", encoding="utf-8") as fh:
+                stamps = json.load(fh)
+        except (OSError, ValueError):
+            stamps = {}
+    have_midi = bool(glob.glob(os.path.join(src_dir, "*.mid")))
+    scripts = sorted(glob.glob(os.path.join(src_dir, "*.py")))
+    names = {os.path.basename(s) for s in scripts}
+    stamps = {k: v for k, v in stamps.items() if k in names}
+    for script in scripts:
+        name = os.path.basename(script)
+        mtime = os.path.getmtime(script)
+        if not force and have_midi and stamps.get(name) == mtime:
+            continue                # this exact version rendered before
+        log(f"rendering {name} ...")
         try:
             subprocess.run([sys.executable, script],
                            cwd=src_dir, capture_output=True, text=True,
                            timeout=120, check=True)
         except (subprocess.CalledProcessError,
                 subprocess.TimeoutExpired) as e:
-            errors.append(f"{os.path.basename(script)}: {e}")
+            errors.append(f"{name}: {e}")
+        stamps[name] = mtime        # error too: retry only when it changes
+    try:
+        with open(stamp_path, "w", encoding="utf-8") as fh:
+            json.dump(stamps, fh)
+    except OSError:
+        pass
     midis = sorted(glob.glob(os.path.join(src_dir, "*.mid")))
     return midis, errors
 
@@ -121,20 +140,29 @@ def run_forwarder(bind_host, bind_port, piano_port=None):
         while True:
             conn, addr = srv.accept()
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            names = mido.get_output_names()
-            target = None
-            if piano_port:
-                target = next((n for n in names
-                               if piano_port.lower() in n.lower()), None)
-            if target is None:
-                target = Player._auto_select(names)
-            loop = "through" in target.lower()
-            print(f"client {addr[0]} -> {target}"
-                  + (" (loopback: silent)" if loop else ""), flush=True)
-            out = mido.open_output(target)
-            parser = mido.Parser()
+            out = None
             count = 0
             try:
+                names = mido.get_output_names()
+                if not names:
+                    print(f"client {addr[0]}: no MIDI output ports here — "
+                          f"is the instrument connected?", flush=True)
+                    continue
+                target = None
+                if piano_port:
+                    target = next((n for n in names
+                                   if piano_port.lower() in n.lower()), None)
+                    if target is None:
+                        print(f"client {addr[0]}: no port matching "
+                              f"{piano_port!r}; available: {names}",
+                              flush=True)
+                if target is None:
+                    target = Player._auto_select(names)
+                loop = "through" in target.lower()
+                print(f"client {addr[0]} -> {target}"
+                      + (" (loopback: silent)" if loop else ""), flush=True)
+                out = mido.open_output(target)
+                parser = mido.Parser()
                 while True:
                     data = conn.recv(4096)
                     if not data:
@@ -143,15 +171,25 @@ def run_forwarder(bind_host, bind_port, piano_port=None):
                     for msg in parser:
                         out.send(msg)
                         count += 1
-            except OSError:
-                pass
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                # One bad connection or a busy/absent port must not
+                # bring the forwarder down; report and keep listening.
+                print(f"client {addr[0]}: {e}", flush=True)
             finally:
-                for ch in range(16):
-                    out.send(mido.Message("control_change", channel=ch,
-                                          control=64, value=0))
-                    out.send(mido.Message("control_change", channel=ch,
-                                          control=123, value=0))
-                out.close()
+                if out is not None:
+                    try:
+                        for ch in range(16):
+                            out.send(mido.Message("control_change",
+                                                  channel=ch,
+                                                  control=64, value=0))
+                            out.send(mido.Message("control_change",
+                                                  channel=ch,
+                                                  control=123, value=0))
+                        out.close()
+                    except Exception:
+                        pass
                 conn.close()
                 print(f"client {addr[0]} disconnected ({count} messages)",
                       flush=True)
@@ -834,36 +872,43 @@ def main(argv):
     mode = "gui"
     track_n = None
     i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--dir":
+    try:
+        while i < len(argv):
+            a = argv[i]
+            if a == "--dir":
+                i += 1
+                src_dir = argv[i]
+            elif a == "--library":
+                i += 1
+                library = argv[i]
+            elif a == "--port":
+                i += 1
+                port = argv[i]
+            elif a == "--remote":
+                i += 1
+                remote = _parse_hostport(argv[i], DEFAULT_FORWARD_PORT)
+            elif a == "--bind":
+                i += 1
+                bind = _parse_hostport(argv[i], DEFAULT_FORWARD_PORT)
+            elif a == "--forward":
+                mode = "forward"
+            elif a == "--list":
+                mode = "list"
+            elif a == "--all":
+                mode = "all"
+            elif a == "--track":
+                i += 1
+                mode, track_n = "track", int(argv[i])
+            else:
+                print(f"unknown argument {a!r}", file=sys.stderr)
+                return 2
             i += 1
-            src_dir = argv[i]
-        elif a == "--library":
-            i += 1
-            library = argv[i]
-        elif a == "--port":
-            i += 1
-            port = argv[i]
-        elif a == "--remote":
-            i += 1
-            remote = _parse_hostport(argv[i], DEFAULT_FORWARD_PORT)
-        elif a == "--bind":
-            i += 1
-            bind = _parse_hostport(argv[i], DEFAULT_FORWARD_PORT)
-        elif a == "--forward":
-            mode = "forward"
-        elif a == "--list":
-            mode = "list"
-        elif a == "--all":
-            mode = "all"
-        elif a == "--track":
-            i += 1
-            mode, track_n = "track", int(argv[i])
-        else:
-            print(f"unknown argument {a!r}", file=sys.stderr)
-            return 2
-        i += 1
+    except (IndexError, ValueError):
+        print(f"bad or missing value after {a!r} — usage: jukebox.py "
+              f"[--dir D | --library D] [--port NAME] "
+              f"[--remote HOST[:PORT]] [--bind HOST[:PORT]] "
+              f"[--forward | --list | --track N | --all]", file=sys.stderr)
+        return 2
 
     if mode == "forward":
         run_forwarder(bind[0], bind[1], piano_port=port)
@@ -907,10 +952,14 @@ def main(argv):
 
         try:
             player = Player(port=port, on_finish=advance, remote=remote)
-        except OSError as e:
-            print(f"could not reach forwarder at {remote[0]}:{remote[1]} "
-                  f"({e}); is 'jukebox.py --forward' running there?",
-                  file=sys.stderr)
+        except (OSError, RuntimeError) as e:
+            if remote:
+                print(f"could not reach forwarder at "
+                      f"{remote[0]}:{remote[1]} ({e}); is "
+                      f"'jukebox.py --forward' running there?",
+                      file=sys.stderr)
+            else:
+                print(e, file=sys.stderr)
             return 1
         if not 0 <= order[0] < len(tracks):
             print(f"track out of range (1-{len(tracks)})", file=sys.stderr)

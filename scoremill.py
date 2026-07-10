@@ -52,8 +52,9 @@ MOTIF TRANSFORMS (string to string)
                            explicit alterations travel with their degree
   invert(frag, axis)       diatonic inversion about an axis pitch;
                            alterations are mirrored (# becomes b)
-  retro(frag)              retrograde (fragment must not contain
-                           barlines, dynamics, or ties)
+  retro(frag)              retrograde; graces stay with their notes and
+                           tuplet members reverse (no barlines,
+                           dynamics, or ties inside)
   stretch(frag, factor)    augmentation (2) or diminution (0.5)
   rebar(frag, beats)       insert barlines every N beats, following
                            sticky durations; errors if a token would
@@ -128,6 +129,8 @@ import sys
 import time
 
 import mido
+
+__version__ = "0.3.0"
 
 TPB = 480
 PIANO_LO, PIANO_HI = 21, 108
@@ -346,7 +349,10 @@ def invert(frag, axis="g4"):
 
 
 def retro(frag):
-    """Reverse the fragment. Barlines, dynamics, and ties are not
+    """Reverse the fragment. A grace note travels with the note it
+    ornaments, and tuplet members reverse within their tuplet. Sticky
+    octaves and durations are written out first, so reversal cannot
+    change what any token means. Barlines, dynamics, and ties are not
     permitted inside; strip them and reapply around the result."""
     toks = _tokenize(frag)
     if "|" in toks:
@@ -360,30 +366,77 @@ def retro(frag):
             raise CompositionError(
                 "retro: remove ties from the fragment — a reversed tie "
                 "points the wrong way")
-    state_dur = "q"
-    explicit = []
-    for t in toks:
-        body = t[1:] if t.startswith("+") else t
-        nm = NOTE_RE.match(body)
+    state = {"oct": 4, "dur": "q"}
+
+    def explicit_pitch(nm):
+        """The pitch part of a note token with its octave written out."""
+        letter, acc = nm.group(1), nm.group(2) or ""
+        if nm.group(3):
+            state["oct"] = int(nm.group(3))
+        if letter == "r":
+            return letter
+        return letter + acc + str(state["oct"])
+
+    def explicit_dur(durtok):
+        if durtok:
+            state["dur"] = durtok
+        return state["dur"]
+
+    def chord_members(inner, where):
+        parts = []
+        for t in inner.split():
+            nm = NOTE_RE.match(t)
+            if not nm or nm.group(1) == "r":
+                raise CompositionError(f"retro: bad chord member '{t}' "
+                                       f"in {where}")
+            parts.append(explicit_pitch(nm))
+        return parts
+
+    units = []                     # each unit: [grace..., principal]
+    graces = []
+    for tok in toks:
+        grace = tok.startswith("+")
+        body = tok[1:] if grace else tok
+        if grace:
+            nm = NOTE_RE.match(body)
+            if not nm or nm.group(1) == "r" or nm.group(4):
+                raise CompositionError(f"retro: bad grace note '{tok}'")
+            graces.append("+" + explicit_pitch(nm) + (nm.group(5) or ""))
+            continue
+        tm = TUPLET_RE.match(body)
         cm = CHORD_RE.match(body)
-        if nm:
-            d = nm.group(4)
-            if d:
-                state_dur = d
-                explicit.append(t)
-            else:
-                explicit.append(("+" if t.startswith("+") else "")
-                                + body + state_dur)
+        nm = NOTE_RE.match(body)
+        if tm:
+            members = []
+            for t in _tokenize(tm.group(1)):
+                mc = CHORD_RE.match(t)
+                if mc:
+                    members.append(
+                        "[" + " ".join(chord_members(mc.group(1), tok))
+                        + "]" + (mc.group(2) or "") + (mc.group(3) or ""))
+                else:
+                    mn = NOTE_RE.match(t)
+                    if not mn:
+                        raise CompositionError(
+                            f"retro: bad tuplet member '{t}' in {tok}")
+                    members.append(explicit_pitch(mn)
+                                   + (mn.group(4) or "") + (mn.group(5) or ""))
+            out = ("{" + " ".join(reversed(members)) + "}"
+                   + explicit_dur(tm.group(2)))
         elif cm:
-            d = cm.group(2)
-            if d:
-                state_dur = d
-                explicit.append(t)
-            else:
-                explicit.append(t.replace("]", "]" + state_dur, 1))
+            out = ("[" + " ".join(chord_members(cm.group(1), tok)) + "]"
+                   + explicit_dur(cm.group(2)) + (cm.group(3) or ""))
+        elif nm:
+            out = (explicit_pitch(nm) + explicit_dur(nm.group(4))
+                   + (nm.group(5) or ""))
         else:
-            explicit.append(t)
-    return " ".join(reversed(explicit))
+            raise CompositionError(f"retro: unrecognized token '{tok}'")
+        units.append(graces + [out])
+        graces = []
+    if graces:
+        raise CompositionError(
+            "retro: a trailing grace note has no note to ornament")
+    return " ".join(t for unit in reversed(units) for t in unit)
 
 
 def stretch(frag, factor):
@@ -575,12 +628,21 @@ class Voice:
                 self._apply_dynamic(DYN[raw[1:]])
                 continue
             if raw in ("cresc", "dim"):
+                if self._cresc_from is not None:
+                    raise CompositionError(
+                        f"voice '{self.name}': '{raw}' while an earlier "
+                        f"cresc/dim is still open — give the first one "
+                        f"its target dynamic (!ppp..!fff) first")
                 self._cresc_from = (len(self.notes), self._vel)
                 continue
             if raw.startswith("+"):
                 m = NOTE_RE.match(raw[1:])
                 if not m or m.group(1) == "r":
                     raise CompositionError(f"bad grace note '{raw}'")
+                if m.group(4):
+                    raise CompositionError(
+                        f"grace note '{raw}' must not carry a duration — "
+                        f"a grace is a fixed flick before the next note")
                 self.notes.append(Note([self._pitch(m)], 0.0,
                                        max(20, self._vel - 8), grace=True))
                 continue
@@ -616,12 +678,20 @@ class Voice:
                         raise CompositionError(
                             f"tuplet member '{t}' must not carry a "
                             f"duration — the span divides equally")
+                    if (cm.group(3) or "").replace("~", ""):
+                        raise CompositionError(
+                            f"tuplet member '{t}' in {raw}: only a tie "
+                            f"'~' may mark a tuplet member")
                     pitches = []
                     for ct in cm.group(1).split():
                         cn = NOTE_RE.match(ct)
                         if not cn or cn.group(1) == "r":
                             raise CompositionError(
                                 f"bad chord member '{ct}' in tuplet {raw}")
+                        if cn.group(4) or cn.group(5):
+                            raise CompositionError(
+                                f"chord member '{ct}' in tuplet {raw} "
+                                f"must not carry a duration or marks")
                         pitches.append(self._pitch(cn))
                     self.notes.append(Note(pitches, each, self._vel,
                                            gate=0.9,
@@ -636,6 +706,10 @@ class Voice:
                     raise CompositionError(
                         f"tuplet member '{t}' must not carry a duration — "
                         f"the span '{durtok or 'sticky'}' divides equally")
+                if (nm.group(5) or "").replace("~", ""):
+                    raise CompositionError(
+                        f"tuplet member '{t}' in {raw}: only a tie '~' "
+                        f"may mark a tuplet member")
                 if nm.group(1) == "r":
                     self.notes.append(Note([], each, 0))
                 else:
@@ -652,6 +726,16 @@ class Voice:
                 nm = NOTE_RE.match(t)
                 if not nm or nm.group(1) == "r":
                     raise CompositionError(f"bad chord member '{t}' in {raw}")
+                if nm.group(4):
+                    raise CompositionError(
+                        f"chord member '{t}' in {raw} must not carry a "
+                        f"duration — write it once after the ']': "
+                        f"[c4 e4]{nm.group(4)}")
+                if nm.group(5):
+                    raise CompositionError(
+                        f"chord member '{t}' in {raw} must not carry "
+                        f"marks — put them after the ']' and duration: "
+                        f"[c4 e4]q{nm.group(5)}")
                 pitches.append(self._pitch(nm))
             beats = self._beats(durtok)
             self._push(pitches, beats, marks or "")
@@ -707,14 +791,21 @@ class Voice:
         if "%" in marks:
             if len(pitches) != 1:
                 raise CompositionError("trill '%' works on single notes")
+            unit = self.song.trill_rate
+            k = int(beats / unit + 1e-9)
+            if k < 3:
+                raise CompositionError(
+                    f"trill '%' on a {beats}-beat note at "
+                    f"trill_rate={unit}: too short to alternate — "
+                    f"lengthen the note or lower Song(trill_rate=)")
+            if k % 2 == 0:
+                k -= 1          # alternation ends upper → main, no stutter
             main = pitches[0]
             upper = self._diatonic_upper(main)
-            unit = self.song.trill_rate
-            n32 = max(2, int(beats / unit))
-            for i in range(n32 - 1):
+            for i in range(k - 1):
                 self.notes.append(Note([main if i % 2 == 0 else upper],
                                        unit, max(20, vel - 6), gate=0.9))
-            rem = beats - (n32 - 1) * unit
+            rem = beats - (k - 1) * unit
             self.notes.append(Note([main], rem, vel, gate))
             return
         self.notes.append(Note(pitches, beats, min(127, vel), gate,
@@ -747,6 +838,9 @@ class Voice:
             raise CompositionError(
                 "harmony: voicing is plain, smooth, shell, rootless, "
                 f"or drop2 (got {voicing!r})")
+        if slots not in ("bar", "half"):
+            raise CompositionError(
+                f'harmony: slots is "bar" or "half" (got {slots!r})')
         slot_beats = self.bpb if slots == "bar" else self.bpb / 2
         prev_sym = None
         prev_voicing = None
@@ -786,10 +880,16 @@ class Voice:
                     moved = p - 12 if p - 12 >= self.song.pitch_lo else p + 12
                     if moved not in sounding:
                         pitches = [moved]
+        for p in pitches:
+            if not self.song.pitch_lo <= p <= self.song.pitch_hi:
+                raise CompositionError(
+                    f"voice '{self.name}': harmony figure reaches MIDI "
+                    f"{p}, outside the instrument range "
+                    f"{self.song.pitch_lo}-{self.song.pitch_hi} — "
+                    f"adjust harmony(octave=)")
         self.notes.append(Note(pitches, beats, vel, gate))
 
-    @staticmethod
-    def _lead(prev_upper, upper):
+    def _lead(self, prev_upper, upper):
         if not prev_upper or not upper:
             return upper
         center = sum(prev_upper) / len(prev_upper)
@@ -797,7 +897,8 @@ class Voice:
         for t in upper:
             best = min((t + 12 * k for k in (-1, 0, 1)),
                        key=lambda x: abs(x - center))
-            out.append(max(PIANO_LO, min(PIANO_HI, best)))
+            out.append(max(self.song.pitch_lo,
+                           min(self.song.pitch_hi, best)))
         return sorted(out)
 
     def _chord_pitches(self, sym, octave):
@@ -1002,11 +1103,35 @@ class Section:
                     nxt = body[i + 1] if i + 1 < len(body) else None
                     if nxt is None:
                         continue          # laissez vibrer on the final note
-                    if nxt.pitches != n.pitches:
+                    if set(nxt.pitches) != set(n.pitches):
                         raise CompositionError(
                             f"voice '{v.name}': tie on MIDI "
                             f"{n.pitches} is not followed by the same "
                             f"pitch — remove '~' or repeat the note")
+            pending = False
+            prev = None
+            for n in v.notes:
+                if n.grace:
+                    pending = True
+                    continue
+                if pending:
+                    struck = bool(n.pitches)
+                    if (struck and prev is not None and prev.tie
+                            and prev.pitches
+                            and set(prev.pitches) == set(n.pitches)):
+                        struck = False    # a tie continuation, not a strike
+                    if not struck:
+                        what = ("a rest" if not n.pitches
+                                else "a tied continuation")
+                        raise CompositionError(
+                            f"voice '{v.name}': a grace note must directly "
+                            f"precede a struck note, not {what}")
+                    pending = False
+                prev = n
+            if pending:
+                raise CompositionError(
+                    f"voice '{v.name}': a grace note at the end of the "
+                    f"voice has no note to ornament")
         lens = {v.name: v.total_beats() for v in self.voices}
         vals = set(round(x, 4) for x in lens.values())
         if len(vals) > 1:
@@ -1043,6 +1168,10 @@ class Song:
         self._ramps = []           # (section, bar_from, bar_to, bpm_to)
 
     def section(self, name, key=None, time=None):
+        if name in self.sections:
+            raise CompositionError(
+                f"section '{name}' already exists — pick a new name "
+                f"(a variant needs its own name too)")
         s = Section(name, self, key=key, time=time)
         self.sections[name] = s
         return s
@@ -1119,6 +1248,10 @@ class Song:
         cursor = 0
         order = order or self.order or list(self.sections)
         for sec_name in order:
+            if sec_name not in self.sections:
+                raise CompositionError(
+                    f"unknown section '{sec_name}' — sections are "
+                    f"{list(self.sections)}")
             sec = self.sections[sec_name]
             sec_len = sec.length_beats()
             bar_ticks = int(sec.bpb * TPB)
@@ -1138,7 +1271,8 @@ class Song:
                     if n.pitches:
                         nxt = next((m for m in v.notes[i + 1:]
                                     if not m.grace), None)
-                        if n.tie and nxt and nxt.pitches == n.pitches:
+                        if (n.tie and nxt
+                                and set(nxt.pitches) == set(n.pitches)):
                             carried = carried if carried is not None else t
                         else:
                             start = carried if carried is not None else t
@@ -1762,6 +1896,43 @@ def _test():
         raise AssertionError("voicing check did not fire")
     except CompositionError as e:
         assert "voicing" in str(e)
+
+    # retro reverses tuplet members, keeps a grace with its note, and
+    # writes sticky octaves and durations out explicitly.
+    assert retro("{c4 d4 e4}q f4q") == "f4q {e4 d4 c4}q"
+    assert retro("+d5 c5q e5q") == "e5q +d5 c5q"
+    assert retro("c5q d e") == "e5q d5q c5q"
+
+    # A trill too short to alternate is rejected.
+    try:
+        Song().section("TR").voice("m").bars("c4s% c4s c4e c4q c4h |")
+        raise AssertionError("trill length check did not fire")
+    except CompositionError as e:
+        assert "trill" in str(e)
+
+    # A chord member must not carry its own duration.
+    try:
+        Song().section("CM").voice("m").bars("[c4q e4]h [c4 e4]h |")
+        raise AssertionError("chord member duration check did not fire")
+    except CompositionError as e:
+        assert "after the ']'" in str(e)
+
+    # A duplicate section name is rejected rather than replaced.
+    dup = Song()
+    dup.section("A")
+    try:
+        dup.section("A")
+        raise AssertionError("duplicate section check did not fire")
+    except CompositionError as e:
+        assert "already exists" in str(e)
+
+    # A harmony figure cannot leave the instrument range silently.
+    try:
+        Song().section("HR").voice("m").harmony("C", style="stride",
+                                                octave=1)
+        raise AssertionError("harmony range check did not fire")
+    except CompositionError as e:
+        assert "range" in str(e)
 
     print("tests passed")
 
