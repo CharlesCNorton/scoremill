@@ -634,6 +634,39 @@ def test_forwarder_survives_port_failures():
         jukebox.mido.open_output = real_open
 
 
+def test_lint_catches_parallel_against_held_note():
+    # Voice b holds c4 across beat 2 while the top line moves; the fifths
+    # fall between the held note and the note struck against it, which a
+    # shared-onset check misses and sounding-pitch sampling catches.
+    song = Song()
+    song.section("H").voice("a").bars("c5q g4q a4q g4q |")
+    song.sections["H"].voice("b").bars("c4h d4q e4q |")
+    song.arrange("H")
+    findings = song.lint(quiet=True)
+    assert any("parallel fifths" in f and "beat 3" in f for f in findings), \
+        findings
+
+
+def test_events_memoized_until_mutation():
+    song = Song(tempo=120)
+    sec = song.section("A")
+    sec.voice("m").bars("c4q e4q g4q c5q |")
+    song.arrange("A")
+    first = song._events()
+    assert song._events() is first          # unchanged: served from cache
+    sec.voice("n").bars("e4q g4q c5q e5q |")
+    assert song._events() is not first      # a new voice invalidated it
+    assert song.report()["duration_s"] == 2.0
+
+
+def test_chord_pitches_matches_harmony_voice():
+    # The module helper and the harmony path share one chord parser.
+    for sym in ("C", "Am7", "F/A", "Cmaj9", "D7b9"):
+        voice = Song().section("S").voice("x")
+        voice.harmony(sym, style="block", octave=4)
+        assert voice.notes[0].pitches == chord_pitches(sym, octave=4), sym
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -703,7 +703,8 @@ class ScoremillJukebox:
                     grouped = [("", "", t, p) for t, p
                                in build_tracks(self.src_dir, force=force)]
             except Exception as e:
-                self.root.after(0, lambda: self.status.set(f"Load failed: {e}"))
+                msg = str(e)          # bind now; e is unbound after the block
+                self.root.after(0, lambda: self.status.set(f"Load failed: {msg}"))
                 self.root.after(0, lambda: self.rerender_btn.config(state="normal"))
                 return
             self.root.after(0, lambda: self._loaded(grouped))
