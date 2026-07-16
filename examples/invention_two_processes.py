@@ -30,13 +30,13 @@ lh.bars(
     f"rw | {shift(S, -7)} | {CS} | {shift(CS, 1)} |"
     f" {shift(CS, -1)} |"
     " f2e c3e a2e c3e f2e a2e c3e f3e |"
-    f" {shift(stretch(S_HALF, 2), -5)} |"
+    f" {shift(stretch(S_HALF, 2), -4)} |"
     " g2e g3e b3e d4e g3q g2q |"
     " [c2 g2 c3]w^ |")
 
 s.arrange("INV")
 s.describe()
-s.lint()
+assert not s.lint(), "counterpoint not clean"
 out = s.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), "invention_two_processes.mid"))
 print("wrote", out)
 if "--play" in sys.argv:

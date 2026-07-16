@@ -59,10 +59,21 @@ def test_cresc_requires_target():
 
 def test_tie_requires_same_pitch():
     song = Song()
-    song.section("D").voice("m").bars("c4h~ d4h |")
     try:
-        song.report()
+        song.section("D").voice("m").bars("c4h~ d4h |")   # rejected at parse
         raise AssertionError("tie check did not fire")
+    except CompositionError as e:
+        assert "tie" in str(e)
+
+
+def test_tie_mismatch_across_bars_calls():
+    # A tie on a bars() call's trailing note is pending, and resolves
+    # (or errors) when the next bars() call supplies the following note.
+    voice = Song().section("X").voice("m")
+    voice.bars("c4h c4h~ |")          # trailing tie: pending, no error yet
+    try:
+        voice.bars("d4h d4h |")       # resolves against d4: mismatch
+        raise AssertionError("carried tie check did not fire")
     except CompositionError as e:
         assert "tie" in str(e)
 
@@ -659,12 +670,116 @@ def test_events_memoized_until_mutation():
     assert song.report()["duration_s"] == 2.0
 
 
+def test_cache_reflects_inplace_note_edit():
+    # Editing a Note in place is the advertised raw-API path and changes
+    # neither _rev nor the note count, so the render must be invalidated
+    # by content, not by a count heuristic.
+    song = Song(expressive=False, humanize=0)   # so velocity passes through
+    voice = song.section("A").voice("m")
+    voice.bars("c4q d4q e4q f4q |")
+    song.arrange("A")
+    assert [p for (_, k, _, p, _) in song.events() if k == "on"][0] == 60
+    voice.notes[0].pitches = [72]              # raw in-place pitch edit
+    assert [p for (_, k, _, p, _) in song.events() if k == "on"][0] == 72
+    voice.notes[0].vel = 33                     # a non-pitch field too
+    assert [b for (_, k, _, p, b) in song.events()
+            if k == "on" and p == 72][0] == 33
+
+
 def test_chord_pitches_matches_harmony_voice():
     # The module helper and the harmony path share one chord parser.
     for sym in ("C", "Am7", "F/A", "Cmaj9", "D7b9"):
         voice = Song().section("S").voice("x")
         voice.harmony(sym, style="block", octave=4)
         assert voice.notes[0].pitches == chord_pitches(sym, octave=4), sym
+
+
+def test_stretch_any_factor():
+    assert stretch("c4e", 3) == "c4q."             # 0.5 * 3 = 1.5
+    assert stretch("c4q d4e", 0.5) == "c4e d4s"
+    try:
+        stretch("c4q", 5)                          # 5 beats: unspellable
+        raise AssertionError("stretch factor check did not fire")
+    except CompositionError as e:
+        assert "not spellable" in str(e)
+
+
+def test_report_pitch_metrics():
+    s = Song(key="C")
+    s.section("A").voice("m").bars("c4q e4q g4q +a4 c5q | c4q f#4q e4q c5q |")
+    s.arrange("A")
+    m = s.report()["sections"][0]["voices"][0]
+    assert m["grace"] == 1                          # the a4 grace is counted
+    assert len(m["pitch_classes"]) == 12
+    assert 0 < m["out_of_key_rate"] < 1             # sounding f# is out of key
+    assert isinstance(m["intervals"], dict)
+    assert 0 <= m["self_similarity"] <= 1
+
+
+def test_absolute_onset_anchor():
+    v = Song(time="7/8").section("A").voice("m").absolute_onsets()
+    v.bars("c5e d5e e5e@1 f5e g5e@2 a5e b5e |")
+    assert abs(v.total_beats() - 3.5) < 1e-9
+    fill = Song().section("F").voice("m").absolute_onsets()
+    fill.bars("c5q d5q@3 |")                        # a rest fills to beat 3
+    assert abs(fill.total_beats() - 4.0) < 1e-9
+    assert fill.notes[1].pitches == []
+
+
+def test_absolute_onset_optin_and_drift():
+    try:
+        Song().section("N").voice("m").bars("c5q@0 c5q c5q c5q |")
+        raise AssertionError("opt-in check did not fire")
+    except CompositionError as e:
+        assert "absolute mode" in str(e)
+    try:
+        Song().section("D").voice("m").absolute_onsets().bars("c5h d5h@1 |")
+        raise AssertionError("drift check did not fire")
+    except CompositionError as e:
+        assert "before the current position" in str(e)
+
+
+def test_drum_voice():
+    s = Song(time="4/4")
+    k = s.section("A").drums("kit", vel=80)
+    k.bars("bde hh sn hh bd hh sn hh | [bd hh]q sn hh sn |")
+    s.arrange("A")
+    ons = [e for e in s.events() if e[1] == "on"]
+    assert {e[2] for e in ons} == {9}               # GM percussion channel
+    assert {36, 38, 42} <= {e[3] for e in ons}      # bd, sn, hh
+    assert s.report()["sections"][0]["voices"][0]["drum"] is True
+    try:
+        Song().section("Z").drums("k").bars("zzq |")
+        raise AssertionError("unknown drum check did not fire")
+    except CompositionError as e:
+        assert "unknown drum" in str(e)
+
+
+def test_lint_strict_adds_checks():
+    s = Song(key="C")
+    s.section("X").voice("hi").bars("g4q g4q c4q g4q |")   # dips below lo
+    s.sections["X"].voice("lo").bars("e4q e4q e4q e4q |")
+    s.arrange("X")
+    full = s.lint(quiet=True)
+    strict = s.lint(quiet=True, mode="strict")
+    assert len(strict) >= len(full)
+    assert any("crossing" in f for f in strict)
+    try:
+        s.lint(quiet=True, mode="bogus")
+        raise AssertionError("mode check did not fire")
+    except CompositionError as e:
+        assert "strict" in str(e)
+
+
+def test_lilypond_export():
+    s = Song(tempo=90, time="3/4", key="F")
+    s.section("A").voice("rh").bars("f4q a4q c5q | [f4 a4 c5]h.^ |")
+    s.arrange("A")
+    ly = s.to_lilypond()
+    assert "\\version" in ly and "\\score" in ly
+    assert "\\key f \\major" in ly and "\\time 3/4" in ly
+    assert "\\new Staff" in ly
+    assert "<f' a' c''>" in ly                      # chord, engraved
 
 
 if __name__ == "__main__":
