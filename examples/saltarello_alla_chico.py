@@ -6,7 +6,7 @@ a cadential trill, an echo variant, and a Picardy coda in A major that
 accelerates through a sixteenth run to one last plink at the top of
 the keyboard. Spirited throughout; dignity nowhere.
 
-lint() reports parallel octaves and fifths between tune and oom-pah.
+lint() reports parallel octaves between tune and oom-pah.
 They are retained deliberately: melody doubling the harmony on strong
 beats is the novelty-piano idiom. The linter is advisory; the one
 physical collision it found during composition (both hands striking

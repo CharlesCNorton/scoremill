@@ -18,14 +18,19 @@ needs no MIDI hardware or backend):
   python jukebox.py --remote HOST   # stream playback there
 
 The forwarder re-selects the instrument on each connection, so it can
-start before the instrument is powered on. Rendering runs each script
-with the host Python; a script writes its .mid next to itself, so one
-script may contribute several tracks. Requires mido, and python-rtmidi
-for real output ports.
+start before the instrument is powered on. The newest connection takes
+the instrument: a jukebox that connects while another holds it
+displaces the old one, whose notes are released, and the displaced
+jukebox reconnects at its next play. Keepalive probes drop a client
+that vanished without closing its connection. Rendering runs each
+script with the host Python; a script writes its .mid next to itself,
+so one script may contribute several tracks. Requires mido, and
+python-rtmidi for real output ports.
 """
 import glob
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -55,14 +60,30 @@ def pretty_title(path):
     return " ".join(w.capitalize() for w in words) or stem
 
 
+def midi_title(path):
+    """The title a MIDI file gives in its opening track-name meta event
+    (scoremill writes Song(title=) there), else pretty_title()."""
+    try:
+        for msg in mido.MidiFile(path).tracks[0]:
+            if msg.type == "track_name" and msg.name.strip():
+                return msg.name.strip()
+            if not msg.is_meta:
+                break
+    except Exception:
+        pass
+    return pretty_title(path)
+
+
 # ── rendering ────────────────────────────────────────────────
 def render_scores(src_dir, log=lambda s: None, force=False):
     """Run each *.py in src_dir so it writes its MIDI (the scoremill
     contract), then return the sorted list of .mid files present.
     Rendering is idempotent: a script simply overwrites its own output,
     and one script may write several files. A stamp file remembers each
-    script's mtime at its last render, so a repeat launch with nothing
-    edited renders nothing; pass force=True to render regardless.
+    script's mtime at its last render and the .mid files that render
+    wrote, so a repeat launch renders only scripts edited since or
+    whose output has gone missing; pass force=True to render
+    regardless. A failed script's error is the last line it printed.
     Returns (midi_paths, errors)."""
     errors = []
     stamp_path = os.path.join(src_dir, ".render_stamp.json")
@@ -73,24 +94,38 @@ def render_scores(src_dir, log=lambda s: None, force=False):
                 stamps = json.load(fh)
         except (OSError, ValueError):
             stamps = {}
-    have_midi = bool(glob.glob(os.path.join(src_dir, "*.mid")))
+
+    def midi_mtimes():
+        return {os.path.basename(p): os.path.getmtime(p)
+                for p in glob.glob(os.path.join(src_dir, "*.mid"))}
+
     scripts = sorted(glob.glob(os.path.join(src_dir, "*.py")))
     names = {os.path.basename(s) for s in scripts}
     stamps = {k: v for k, v in stamps.items() if k in names}
     for script in scripts:
         name = os.path.basename(script)
         mtime = os.path.getmtime(script)
-        if not force and have_midi and stamps.get(name) == mtime:
-            continue                # this exact version rendered before
+        stamp = stamps.get(name)
+        if (not force and isinstance(stamp, dict)
+                and stamp.get("mtime") == mtime
+                and all(os.path.exists(os.path.join(src_dir, m))
+                        for m in stamp.get("midi", []))):
+            continue                # this exact version rendered, output intact
         log(f"rendering {name} ...")
+        before = midi_mtimes()
         try:
             subprocess.run([sys.executable, script],
                            cwd=src_dir, capture_output=True, text=True,
                            timeout=120, check=True)
-        except (subprocess.CalledProcessError,
-                subprocess.TimeoutExpired) as e:
+        except subprocess.CalledProcessError as e:
+            said = (e.stderr or e.stdout or "").strip().splitlines()
+            errors.append(f"{name}: {said[-1] if said else e}")
+        except subprocess.TimeoutExpired as e:
             errors.append(f"{name}: {e}")
-        stamps[name] = mtime        # error too: retry only when it changes
+        wrote = sorted(m for m, t in midi_mtimes().items()
+                       if before.get(m) != t)
+        # stamped on error too: a failing script retries once it changes
+        stamps[name] = {"mtime": mtime, "midi": wrote}
     try:
         with open(stamp_path, "w", encoding="utf-8") as fh:
             json.dump(stamps, fh)
@@ -105,97 +140,186 @@ class NetworkOutput:
     """A stand-in for a mido output port that streams each message as
     raw MIDI bytes over TCP to a forwarder (see run_forwarder). Lets the
     jukebox run on a machine with no MIDI hardware and play through an
-    instrument attached to another host — the forwarder just relays."""
+    instrument attached to another host — the forwarder just relays.
+    Once the forwarder closes the connection (another client took the
+    instrument, or it restarted), `lost` is true and sends are dropped
+    until reconnect() opens a new one."""
 
     def __init__(self, host, port):
-        self.sock = socket.create_connection((host, port), timeout=5)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.addr = (host, port)
         self.port_name = f"{host}:{port} (network forwarder)"
+        self.sock = None
+        self.reconnect()
+
+    @property
+    def lost(self):
+        return self.sock is None
+
+    def _open(self):
+        """Whether the forwarder still holds the connection. It never
+        sends, so a readable socket means it closed or reset."""
+        try:
+            self.sock.setblocking(False)
+            try:
+                return self.sock.recv(1, socket.MSG_PEEK) != b""
+            finally:
+                self.sock.settimeout(5)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+
+    def reconnect(self):
+        """Open a connection unless the current one is still held."""
+        if self.sock is not None and not self._open():
+            self.close()
+        if self.sock is None:
+            self.sock = socket.create_connection(self.addr, timeout=5)
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def send(self, msg):
+        if self.sock is None:
+            return
         try:
             self.sock.sendall(bytes(msg.bytes()))
         except OSError:
-            pass
+            self.close()
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+
+def release_all(out):
+    """Lift the sustain and soft pedals and silence every note on all
+    16 channels, so a stop or a departed client leaves nothing sounding."""
+    for ch in range(16):
+        for control in (64, 67, 123):
+            out.send(mido.Message("control_change", channel=ch,
+                                  control=control, value=0))
+
+
+def _keepalive(conn):
+    """Probe an idle connection so a client that vanished without
+    closing it (a host asleep or off the network) is dropped within
+    about 25 s rather than holding the instrument and its notes."""
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5),
+                        ("TCP_KEEPCNT", 3)):
+        opt = getattr(socket, name, None)
+        if opt is not None:
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, opt, value)
+            except OSError:
+                pass
+
+
+class _Relay:
+    """The forwarder's current client: its socket, the output it plays,
+    and a parser for its byte stream."""
+
+    def __init__(self, conn, addr, out):
+        self.conn, self.addr, self.out = conn, addr, out
+        self.parser = mido.Parser()
+        self.count = 0
+
+    def pump(self):
+        """Relay what the client sent; False once it is gone."""
+        try:
+            data = self.conn.recv(4096)
+            if not data:
+                return False
+            self.parser.feed(data)
+            for msg in self.parser:
+                self.out.send(msg)
+                self.count += 1
+            return True
+        except Exception as e:      # a dead peer or a failing port
+            print(f"client {self.addr[0]}: {e}", flush=True)
+            return False
 
     def close(self):
         try:
-            self.sock.close()
-        except OSError:
+            release_all(self.out)
+            self.out.close()
+        except Exception:
             pass
+        self.conn.close()
+        print(f"client {self.addr[0]} disconnected ({self.count} messages)",
+              flush=True)
+
+
+def _attach(conn, addr, piano_port):
+    """Open the instrument for a new client. Returns a _Relay, or None
+    after reporting why the instrument could not be opened."""
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _keepalive(conn)
+        names = mido.get_output_names()
+        if not names:
+            raise RuntimeError("no MIDI output ports here — is the "
+                               "instrument connected?")
+        target = None
+        if piano_port:
+            target = next((n for n in names
+                           if piano_port.lower() in n.lower()), None)
+            if target is None:
+                print(f"client {addr[0]}: no port matching {piano_port!r}; "
+                      f"available: {names}", flush=True)
+        if target is None:
+            target = Player._auto_select(names)
+        loop = "through" in target.lower()
+        print(f"client {addr[0]} -> {target}"
+              + (" (loopback: silent)" if loop else ""), flush=True)
+        return _Relay(conn, addr, mido.open_output(target))
+    except Exception as e:
+        # One bad connection or a busy/absent port must not bring the
+        # forwarder down; report and keep listening.
+        print(f"client {addr[0]}: {e}", flush=True)
+        conn.close()
+        print(f"client {addr[0]} disconnected (0 messages)", flush=True)
+        return None
 
 
 def run_forwarder(bind_host, bind_port, piano_port=None):
     """Relay MIDI bytes from a network client to a local instrument.
     Re-selects the output on every new connection, so turning the
-    instrument on between sessions just works, and releases all notes
-    when a client disconnects."""
+    instrument on between sessions just works. The newest connection
+    takes the instrument: one arriving while another client holds it
+    displaces that client, so an idle or stale client never locks the
+    others out and nothing queues up to play late. Every departure,
+    whether a close, a displacement, or a peer that stops answering
+    keepalive probes, releases all notes and both pedals."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((bind_host, bind_port))
-    srv.listen(1)
+    srv.listen(4)
     print(f"forwarder listening on {bind_host}:{bind_port} (Ctrl-C to stop)",
           flush=True)
+    cur = None
     try:
         while True:
-            conn, addr = srv.accept()
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            out = None
-            count = 0
-            try:
-                names = mido.get_output_names()
-                if not names:
-                    print(f"client {addr[0]}: no MIDI output ports here — "
-                          f"is the instrument connected?", flush=True)
-                    continue
-                target = None
-                if piano_port:
-                    target = next((n for n in names
-                                   if piano_port.lower() in n.lower()), None)
-                    if target is None:
-                        print(f"client {addr[0]}: no port matching "
-                              f"{piano_port!r}; available: {names}",
-                              flush=True)
-                if target is None:
-                    target = Player._auto_select(names)
-                loop = "through" in target.lower()
-                print(f"client {addr[0]} -> {target}"
-                      + (" (loopback: silent)" if loop else ""), flush=True)
-                out = mido.open_output(target)
-                parser = mido.Parser()
-                while True:
-                    data = conn.recv(4096)
-                    if not data:
-                        break
-                    parser.feed(data)
-                    for msg in parser:
-                        out.send(msg)
-                        count += 1
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                # One bad connection or a busy/absent port must not
-                # bring the forwarder down; report and keep listening.
-                print(f"client {addr[0]}: {e}", flush=True)
-            finally:
-                if out is not None:
-                    try:
-                        for ch in range(16):
-                            out.send(mido.Message("control_change",
-                                                  channel=ch,
-                                                  control=64, value=0))
-                            out.send(mido.Message("control_change",
-                                                  channel=ch,
-                                                  control=123, value=0))
-                        out.close()
-                    except Exception:
-                        pass
-                conn.close()
-                print(f"client {addr[0]} disconnected ({count} messages)",
-                      flush=True)
+            watch = [srv] + ([cur.conn] if cur else [])
+            ready = select.select(watch, [], [])[0]
+            if srv in ready:
+                conn, addr = srv.accept()
+                if cur is not None:
+                    print(f"client {cur.addr[0]} displaced by {addr[0]}",
+                          flush=True)
+                    cur.close()
+                cur = _attach(conn, addr, piano_port)
+            elif cur is not None and not cur.pump():
+                cur.close()
+                cur = None
     except KeyboardInterrupt:
         print("\nforwarder stopped")
     finally:
+        if cur is not None:
+            cur.close()
         srv.close()
 
 
@@ -203,11 +327,13 @@ def run_forwarder(bind_host, bind_port, piano_port=None):
 class Player:
     """Streams a MIDI file to an output port in a background thread,
     applying live tempo, channel volume, and a voice override, and
-    releasing every note and pedal on stop or finish."""
+    releasing every note and pedal on stop or finish. `on_finish` is
+    called when a track ends by itself; `on_lost` when a network
+    forwarder closes the connection mid-track."""
 
     HINTS = ("piano", "keyboard", "digital", "synth", "fluid", "usb")
 
-    def __init__(self, port=None, on_finish=None, remote=None):
+    def __init__(self, port=None, on_finish=None, remote=None, on_lost=None):
         if remote is not None:
             self.out = NetworkOutput(*remote)
             self.port_name = self.out.port_name
@@ -232,6 +358,7 @@ class Player:
                       file=sys.stderr)
             self.out = mido.open_output(match)
         self.on_finish = on_finish
+        self.on_lost = on_lost
         self.tempo_pct = 100
         self.volume = 100
         self.voice = 0
@@ -264,15 +391,13 @@ class Player:
     def set_voice(self, program):
         self.voice = max(0, min(127, int(program)))
         for ch in range(16):
+            if ch == 9:
+                continue                      # channel 10 holds the drum kit
             self.out.send(mido.Message("program_change", channel=ch,
                                        program=self.voice))
 
     def _panic(self):
-        for ch in range(16):
-            self.out.send(mido.Message("control_change", channel=ch,
-                                       control=64, value=0))    # sustain off
-            self.out.send(mido.Message("control_change", channel=ch,
-                                       control=123, value=0))   # all notes off
+        release_all(self.out)
 
     def stop(self):
         self._stop.set()
@@ -285,7 +410,13 @@ class Player:
         self.now = None
 
     def play(self, path, title=None):
+        """Start a track. On a network output, first reopens a
+        connection the forwarder closed; raises OSError when the
+        forwarder cannot be reached."""
         self.stop()
+        reconnect = getattr(self.out, "reconnect", None)
+        if reconnect:
+            reconnect()
         self._stop.clear()
         self.now = title or pretty_title(path)
         self._thread = threading.Thread(target=self._run, args=(path,),
@@ -302,6 +433,7 @@ class Player:
             self.out.send(mido.Message("control_change", channel=ch,
                                        control=7, value=self.volume))
         self.set_voice(self.voice)
+        lost = False
         try:
             for msg in mid:                       # msg.time is delta seconds
                 if self._stop.is_set():
@@ -321,9 +453,16 @@ class Player:
                 if msg.type == "program_change":
                     continue                      # our voice override wins
                 self.out.send(msg)
+                if getattr(self.out, "lost", False):
+                    lost = True                   # the forwarder let us go
+                    break
         finally:
             self._panic()
-        if not self._stop.is_set():
+        if lost:
+            self.now = None
+            if self.on_lost:
+                self.on_lost()
+        elif not self._stop.is_set():
             self.now = None
             if self.on_finish:
                 self.on_finish()
@@ -338,7 +477,7 @@ def build_tracks(src_dir, force=False):
         src_dir, log=lambda s: print(s, file=sys.stderr), force=force)
     for e in errors:
         print(f"warning: {e}", file=sys.stderr)
-    return [(pretty_title(m), m) for m in midis]
+    return [(midi_title(m), m) for m in midis]
 
 
 def scan_library(root):
@@ -665,7 +804,8 @@ class ScoremillJukebox:
             if self.mode.get() == "local":
                 name = self.local_port.get()
                 port = None if name in ("", "Auto") else name
-                p = Player(port=port, on_finish=self._finish)
+                p = Player(port=port, on_finish=self._finish,
+                           on_lost=self._lost)
             else:
                 host = self.remote_host.get().strip()
                 if not host:
@@ -675,7 +815,8 @@ class ScoremillJukebox:
                     rport = int(self.remote_port.get())
                 except ValueError:
                     rport = DEFAULT_FORWARD_PORT
-                p = Player(remote=(host, rport), on_finish=self._finish)
+                p = Player(remote=(host, rport), on_finish=self._finish,
+                           on_lost=self._lost)
         except Exception as e:
             self.status.set(f"Output error: {e}")
             self.status_lbl.config(fg=RED)
@@ -759,10 +900,8 @@ class ScoremillJukebox:
             return
         title, path = self._visible[sel[0]]
         p = self._ensure_player()
-        if p is None:
+        if p is None or not self._start(p, path, title):
             return
-        self.playing_path = path
-        p.play(path, title)
         self.now_playing.set(title)
         secs = _midi_seconds(path)
         self.duration.set(f"{int(secs // 60)}m {int(secs % 60)}s" if secs else "")
@@ -777,9 +916,33 @@ class ScoremillJukebox:
         self.status.set("● Ready")
         self.status_lbl.config(fg=DIM)
 
+    def _start(self, p, path, title):
+        """Play a track, reporting an unreachable forwarder in the status
+        line. Returns whether playback started."""
+        try:
+            p.play(path, title)
+        except OSError as e:
+            self.status.set(f"Output error: {e}")
+            self.status_lbl.config(fg=RED)
+            return False
+        self.playing_path = path
+        return True
+
     def _finish(self):
         """Player thread signals a natural end; hop to the tk thread."""
         self.root.after(0, self._advance)
+
+    def _lost(self):
+        """Player thread signals the forwarder closed the connection;
+        hop to the tk thread."""
+        self.root.after(0, self._dropped)
+
+    def _dropped(self):
+        self.now_playing.set("Stopped")
+        self.duration.set("")
+        self.status.set("● Forwarder closed the connection; "
+                        "Play takes the instrument back")
+        self.status_lbl.config(fg=YELLOW)
 
     def _advance(self):
         if self.loop.get() and self.playing_path:
@@ -804,9 +967,8 @@ class ScoremillJukebox:
             return
         title = next((t for t, pp in self._visible if pp == path),
                      pretty_title(path))
-        self.playing_path = path
-        p.play(path, title)
-        self.now_playing.set(title)
+        if self._start(p, path, title):
+            self.now_playing.set(title)
 
     def _toggle_auto(self):
         self.autoplay.set(not self.autoplay.get())
@@ -939,20 +1101,33 @@ def main(argv):
         done = threading.Event()
         order = ([track_n - 1] if mode == "track"
                  else list(range(len(tracks))))
-        state = {"k": 0}
+        state = {"k": 0, "failed": False}
+
+        def start(title, path):
+            print(f"> {title}")
+            try:
+                player.play(path, title)
+            except OSError as e:
+                print(f"could not reach the forwarder ({e})", file=sys.stderr)
+                state["failed"] = True
+                done.set()
 
         def advance():
             state["k"] += 1
             if state["k"] < len(order):
-                idx = order[state["k"]]
-                title, path = tracks[idx]
-                print(f"> {title}")
-                player.play(path, title)
+                start(*tracks[order[state["k"]]])
             else:
                 done.set()
 
+        def lost():
+            print("the forwarder closed the connection (another client "
+                  "took the instrument, or it restarted)", file=sys.stderr)
+            state["failed"] = True
+            done.set()
+
         try:
-            player = Player(port=port, on_finish=advance, remote=remote)
+            player = Player(port=port, on_finish=advance, remote=remote,
+                            on_lost=lost)
         except (OSError, RuntimeError) as e:
             if remote:
                 print(f"could not reach forwarder at "
@@ -965,10 +1140,8 @@ def main(argv):
         if not 0 <= order[0] < len(tracks):
             print(f"track out of range (1-{len(tracks)})", file=sys.stderr)
             return 2
-        title, path = tracks[order[0]]
         print(f"port: {player.port_name}")
-        print(f"> {title}")
-        player.play(path, title)
+        start(*tracks[order[0]])
         try:
             while not done.wait(0.2):
                 pass
@@ -976,7 +1149,7 @@ def main(argv):
             print("\n(interrupted)")
         finally:
             player.close()
-        return 0
+        return 1 if state["failed"] else 0
 
     return 0
 

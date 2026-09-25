@@ -2,8 +2,9 @@
 """scoremill MCP server.
 
 Exposes scoremill to an MCP client (Claude Desktop, Claude Code, ...):
-build a song from a JSON spec and get its MIDI, report, lint, or engraved
-LilyPond, plus the motif transforms and the chord/scale query helpers.
+build a song from a JSON spec and get its MIDI, report, lint, chord
+analysis, or engraved LilyPond, plus the motif transforms and the
+chord/scale query helpers.
 
 Register with Claude Code:
 
@@ -15,19 +16,26 @@ Requires `pip install "mcp[cli]" scoremill` (or run from a clone).
 SONG SPEC (the shape every build tool takes)
 
     {
+      "title": "Evening", "composer": "An Agent",
       "tempo": 96, "time": "4/4", "key": "Am", "pickup": 0,
       "humanize": 1, "swing": 0.5, "swing_unit": "eighth",
       "expressive": true, "fermata": 1.55, "trill_rate": 0.125,
+      "dynamics": {"p": 45},
       "sections": [
         {"name": "A", "key": "Am", "time": "6/8",
          "pedal": "bar", "soft": false,
          "rubato": {"depth": 0.05, "phrase": 2, "shape": "arch"},
+         "swing": {"amount": 0.62, "unit": "eighth"},
          "voices": [
-           {"name": "rh", "vel": 52, "octave": 4,
+           {"name": "rh", "vel": 52, "octave": 4, "absolute": false,
             "bars": "!mf a4e c5e e5q. | ..."},
            {"name": "lh", "vel": 40, "channel": 0,
             "harmony": {"symbols": "Am G Am E7", "style": "broken",
                         "voicing": "smooth", "avoid": "rh"}},
+           {"name": "arp", "harmony": {"symbols": "Am*2 E7*2",
+                                       "slots": "half", "octave": 2,
+                                       "pattern": "0 2 3 4 3 2",
+                                       "unit": 0.3333333333333333}},
            {"name": "kit", "drums": true, "bars": "bde hh sn hh ... |"}
          ]}
       ],
@@ -44,8 +52,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 
 import scoremill
-from scoremill import (CompositionError, Song, chord_pitches, invert, rebar,
-                       retro, scale_pitches, shift, stretch)
+from scoremill import (CompositionError, Song, chord_pitches, double,
+                       harmonize, invert, rebar, retro, scale_pitches, shift,
+                       stretch, transpose, transpose_chords)
 
 mcp = FastMCP("scoremill")
 
@@ -59,12 +68,15 @@ def build_song(spec: dict) -> Song:
              expressive=spec.get("expressive", True),
              fermata=spec.get("fermata", 1.55),
              trill_rate=spec.get("trill_rate", 0.125),
-             pitch_range=tuple(spec.get("pitch_range", (21, 108))))
+             pitch_range=tuple(spec.get("pitch_range", (21, 108))),
+             title=spec.get("title"), composer=spec.get("composer"),
+             dynamics=spec.get("dynamics"))
     for sd in spec.get("sections", []):
         sec = s.section(sd["name"], key=sd.get("key"), time=sd.get("time"))
         for vd in sd.get("voices", []):
             if vd.get("drums"):
                 v = sec.drums(vd.get("name", "kit"), vel=vd.get("vel", 70))
+                v.absolute_onsets(vd.get("absolute", False))
             else:
                 v = sec.voice(vd.get("name", "v"), vel=vd.get("vel", 50),
                               octave=vd.get("octave", 4),
@@ -82,7 +94,8 @@ def build_song(spec: dict) -> Song:
                 v.harmony(h["symbols"], style=h.get("style", "block"),
                           slots=h.get("slots", "bar"),
                           octave=h.get("octave", 3),
-                          voicing=h.get("voicing", "plain"), avoid=avoid)
+                          voicing=h.get("voicing", "plain"), avoid=avoid,
+                          pattern=h.get("pattern"), unit=h.get("unit", 0.5))
         if sd.get("pedal") is not None:
             sec.pedal(sd["pedal"])
         if sd.get("soft"):
@@ -91,6 +104,9 @@ def build_song(spec: dict) -> Song:
             r = sd["rubato"]
             sec.rubato(r.get("depth", 0.05), r.get("phrase", 2),
                        r.get("shape", "arch"))
+        if sd.get("swing"):
+            sw = sd["swing"]
+            sec.swing(sw.get("amount", 0.62), sw.get("unit", "eighth"))
     for tc in spec.get("tempo_changes", []):
         s.tempo_change(tc["section"], tc["bar"], tc["bpm"])
     for r in spec.get("ritardando", []):
@@ -118,13 +134,14 @@ def report(spec: dict) -> dict:
 
 
 @mcp.tool()
-def lint(spec: dict, mode: str = "full") -> dict:
+def lint(spec: dict, mode: str = "full", only: str = "") -> dict:
     """Build the song and return its counterpoint findings. mode is
     "full" (collisions + parallels), "homophonic" (collisions only), or
     "strict" (adds voice crossings, unresolved leading tones, unprepared
-    dissonances, and tessitura warnings)."""
-    return _guard(lambda: {"findings": build_song(spec).lint(quiet=True,
-                                                             mode=mode)})
+    dissonances, tessitura warnings, and chords too wide for one hand).
+    `only` names one section to check alone."""
+    return _guard(lambda: {"findings": build_song(spec).lint(
+        quiet=True, mode=mode, only=only or None)})
 
 
 @mcp.tool()
@@ -155,13 +172,35 @@ def events(spec: dict) -> dict:
 
 
 @mcp.tool()
+def harmony_analysis(spec: dict, per: str = "beat") -> dict:
+    """Build the song and name the chord that sounds in each window of a
+    beat, half bar, or bar (`per`), merging runs of one chord: a list of
+    {section, at, beats, chord}. Use it to check written harmony against
+    the intended progression."""
+    return _guard(lambda: {"chords": build_song(spec).chords(per=per)})
+
+
+@mcp.tool()
 def transform(kind: str, fragment: str, degrees: int = 0,
               axis: str = "g4", factor: float = 2.0,
-              beats_per_bar: float = 4.0) -> dict:
+              beats_per_bar: float = 4.0, semitones: int = 0,
+              key: str = "C") -> dict:
     """Apply a motif transform to a notation fragment, string to string.
     kind: "shift" (uses degrees), "invert" (uses axis), "retro",
-    "stretch" (uses factor), or "rebar" (uses beats_per_bar)."""
+    "stretch" (uses factor), "rebar" (uses beats_per_bar), "transpose"
+    (chromatic, uses semitones and the key the fragment is read in),
+    "double" (adds each note a diatonic interval away: degrees 7 or -7
+    for octaves, -2 for thirds), or "transpose_chords" (the fragment is
+    chord symbols, moved by semitones and spelled for key, or for the
+    new key when key is left at "C")."""
     def go():
+        if kind == "transpose":
+            return {"result": transpose(fragment, semitones, key)}
+        if kind == "double":
+            return {"result": double(fragment, degrees)}
+        if kind == "transpose_chords":
+            return {"result": transpose_chords(fragment, semitones,
+                                               None if key == "C" else key)}
         if kind == "shift":
             return {"result": shift(fragment, degrees)}
         if kind == "invert":
@@ -173,6 +212,21 @@ def transform(kind: str, fragment: str, degrees: int = 0,
         if kind == "rebar":
             return {"result": rebar(fragment, beats_per_bar)}
         return {"error": f"unknown transform '{kind}'"}
+    return _guard(go)
+
+
+@mcp.tool()
+def harmonize_melody(fragment: str, symbols: str, key: str = "C",
+                     voices: int = 3, bass: str = "",
+                     slots: str = "bar") -> dict:
+    """Voice a melody fragment as chords under chord symbols (one per
+    bar, or per `slots` beats given as a number), string to string, with
+    the added notes chosen so that no voices, and none against the
+    optional `bass` fragment, move in consecutive fifths or octaves."""
+    def go():
+        per = slots if slots in ("bar",) else float(slots)
+        return {"result": harmonize(fragment, symbols, key, voices,
+                                    bass=bass or None, slots=per)}
     return _guard(go)
 
 

@@ -96,14 +96,18 @@ voice 'A.rh' bar 2: has 3.0 beats, expected 4.0 — short by 1.0 beats (a 'q').
 | Element | Syntax | Notes |
 |---|---|---|
 | Pitch | `c d e f g a b` + `# b n` + octave | octave is sticky per voice; key signature applies (`key="F"` makes `b` mean B-flat, `bn` natural); minor keys (`Am`, `Dm`, ...) supported |
-| Duration | trailing `w h q e s t`, optional `.` | sticky; `r` = rest |
+| Duration | trailing `w h q e s t`, up to two dots (`q.`, `q..`) | sticky; `r` = rest |
+| Repeat | `c4e*4`, `(c4e d4e)*3`, `(c4w \|)*8` | writes a token or a group out N times; a group may hold barlines |
 | Chord | `[c4 e g]h` | shared duration |
 | Tuplet | `{c4 d4 e4}q`, `{[c4 e4] d4}q` | members divide the span equally; a member may be a chord |
 | Grace | `+d5` | sounds just before the next note; stackable |
 | Tie | `c5h~` | the next note must repeat the pitch (validated); a tie on a voice's last note is laissez vibrer |
-| Marks | `>` accent · `'` staccato · `_` legato · `^` fermata · `&` roll · `%` trill | after the duration; fermata length and trill rate are configurable on `Song` |
-| Dynamics | `!ppp !pp !p !mp !mf !f !ff !fff`, `cresc`, `dim` | sticky; cresc/dim interpolate to the next mark, which must exist (validated) |
-| Barline | `\|` | asserts the bar is exactly full |
+| Marks | `>` accent · `'` staccato · `_` legato · `^` fermata · `&` roll · `%` trill | after the duration; a fermata holds the moment, stretching time by `Song(fermata=)` (on a rest, `rh^`, it is a general pause); trill rate is configurable on `Song` |
+| Pedal | `ped`, `lift` | `ped` presses the sustain pedal at the next note, or changes it there; `lift` releases it; a section ends lifted |
+| Dynamics | `!ppp !pp !p !mp !mf !f !ff !fff`, `cresc`, `dim` | sticky; cresc/dim interpolate to the next mark, which must exist (validated), and keep accents |
+| Barline | `\|` | asserts the bar is exactly full; `Song(pickup=N)` allows a short first bar, and bars then count from the first downbeat |
+| Onset | `c5e@3` | after `voice.absolute_onsets()`, starts the note at beat 3 of the voice; a gap fills with a rest, the marks and graces written before the note stay with it, and an onset that earlier material already passed is an error |
+| Drums | `bde hh sn hh`, `[bd hh]q` | in a `section.drums()` voice (General MIDI channel 10): drum names in place of pitches, with durations, stacks, and `>` accents |
 
 ## Motif transforms
 
@@ -116,6 +120,8 @@ invert(frag, axis="g4")     # mirror about an axis pitch
 retro(frag)                 # retrograde
 stretch(frag, 2)            # augmentation (0.5 for diminution)
 rebar(frag, 3)              # re-insert barlines every 3 beats
+transpose(frag, 3)          # chromatic: up a minor third
+double(frag, -7)            # in octaves (the octave below added)
 ```
 
 Explicit alterations travel with their scale degree under `shift` and
@@ -129,10 +135,20 @@ therefore the barring, so pair it with `rebar`, which re-inserts
 barlines at a chosen bar length and errors if a note would straddle
 one.
 
-To move a finished piece to another key, `song.transpose(semitones)`
+`transpose(frag, semitones, key="C")` is the chromatic counterpart of
+`shift`. It reads the fragment in `key` and spells each result by
+interval, so up a minor third from B is D rather than C double-sharp,
+with explicit accidentals that read the same under any signature. To
+move a finished piece to another key, `song.transpose(semitones)`
 shifts every entered note in place and relabels the keys, raising if a
-note would leave the instrument range. This is chromatic transposition
-of the whole song, distinct from the diatonic `shift` on fragments.
+note would leave the instrument range.
+
+`double(frag, degrees)` thickens a line the way a pianist does:
+`double(tune, -7)` plays it in octaves, `double(tune, 7)` adds the
+octave above, and `double(tune, -2)` adds a third below. An octave
+keeps each note's accidental, so it is exact; a third or a sixth takes
+the key signature, as a hand playing in thirds does. Chords double
+every member and tuplet members become chords.
 
 ## Harmony
 
@@ -154,12 +170,49 @@ disturbed. `harmony()` takes its own `octave` argument for the
 register of the chord roots, independent of the octave the voice uses
 for melodic input.
 
+Any figure the styles do not cover can be written as a `pattern`:
+indices into the chord's tone ladder, which is its tones stacked up by
+octaves with a slash bass at index 0, stepped `unit` beats at a time
+and repeated to fill each slot. `"0+4"` strikes two ladder tones at
+once and `"r"` rests. A rolling Rachmaninoff left hand in triplets, a
+Horowitz piccolo obbligato, or an Alberti bass in sixteenths is one
+line:
+
+```python
+lh.harmony("Bbm Bbm/A Gb F7", slots="half", octave=2,
+           pattern="0 2 3 4 3 2", unit=1/3)
+piccolo.harmony("Ab Eb7*2 Ab", octave=5, pattern="3 4 5 6 5 4 3 4",
+                unit=0.25)
+```
+
+Chord symbols repeat with `*` (`"Am*4"`). `slots="half"` places two
+symbols in a bar, and a number places one per that many beats, so
+`slots=1` splits a 3/4 bar one beat plus two with `"Dm A7 ."`.
+`transpose_chords("C G7/B Am", 1)` moves a progression, spelled for
+its new key: `"Db Ab7/C Bbm"`.
+
+`harmonize(melody, symbols, key=, voices=3, bass=)` voices the melody
+itself as chords, string to string: each note becomes the top of a
+chord of `voices` notes drawn from the symbol under it. The added notes
+are chosen across the whole passage by dynamic programming, so no two
+voices, and no voice against the given bass line, move in consecutive
+fifths or octaves, the inner voices move as little as they can, and
+each chord keeps its third; a tied note keeps its chord, and rests,
+graces, trills, and marks pass through. It is the counterpart of
+`lint()`: where the linter finds parallels in chords stacked by hand,
+`harmonize` does not write them.
+
+```python
+rh.bars(harmonize(theme, "Dm A7 Dm C7 F C Dm A", key="Dm", bass=ground))
+```
+
 `avoid=<voice>` makes the accompaniment melody-aware: chord tones that
 would double the named voice's pitch classes on a shared onset are
 dropped, and single figure tones that would collide at the exact
 unison move an octave away. When the song declares a pickup and the
 accompaniment voice is still empty, `harmony()` inserts the pickup
-rest itself.
+rest itself; the rest gives way when the voices written by hand open
+on a downbeat, whichever is written first.
 
 ## Expression
 
@@ -177,23 +230,61 @@ s.ritardando("A", 7, 8, 60)         # linear ramp; a faster target
 `expressive` adds downbeat lean, melodic-contour shading, and top-note
 voicing inside chords; `humanize` adds slight timing and velocity
 variation. `swing_unit` swings eighths or sixteenths; `fermata` sets
-how far a `^` note overshoots its written length; `trill_rate` sets a
-`%` trill's alternation speed. Rubato is an `"arch"` that presses
-forward and relaxes, or a `"cradle"` that broadens mid-phrase.
+how much longer the music takes under a `^` (the tempo is divided by
+it there, for every voice); `trill_rate` sets a `%` trill's
+alternation speed. Rubato is an `"arch"` that presses forward and
+relaxes, or a `"cradle"` that broadens mid-phrase. Hairpins follow
+time rather than the note count, so a trill inside one takes only its
+share of the swell.
+
+For pedaling that follows the harmony rather than the barline, write
+it into a voice: `ped` presses (or changes) the pedal at the next note
+and `lift` releases it. `section.swing(0.66)` gives one section its own
+swing, so a straight verse can lead into a swung chorus, and
+`Song(dynamics={"p": 45, "f": 80})` retunes the velocity of any
+dynamic mark to suit an instrument's touch.
+
+Tempo changes, ramps, and rubato belong to their section, and every
+section begins at the song tempo. In a section that opens with a
+pickup, bar numbers, pedal changes, swing, and the downbeat lean all
+count from the first downbeat, as `lint()` does.
 
 ## Analysis
 
 ```python
 s.lint()      # collisions and parallels, located by bar and beat
 s.report()    # dict: sections, voices, ranges, density, duration, lint
+s.chords()    # the harmony that sounds, beat by beat
 ```
 
 `lint()` reports two things, each located by bar and beat: collisions,
 where two voices sound the same pitch at once, whether struck together
 or struck against a held note; and consecutive parallel fifths or
 octaves, checked on both the top and the bottom line of each voice
-pair. `report()` exists so an agent can check its own work
-programmatically, and its duration integrates the full tempo map:
+pair. `lint(mode="strict")` adds voice crossings, unresolved leading
+tones, unprepared dissonances struck on a beat, extreme or very wide
+tessitura, and unrolled chords wider than a tenth, which one hand
+cannot reach; these fire on free counterpoint by design.
+`lint(only="Fugato")` checks one section, so a fugato can be held to
+full counterpoint inside a piece linted as homophonic.
+
+`chords(per="beat")` names the chord that sounds in each beat (or half
+bar, or bar), weighing every pitched voice's notes by how long they
+sound and writing a slash bass when the lowest note is not the root.
+Runs of one chord merge. It is the closest thing to ears: compare the
+progression you meant with the one you wrote.
+
+```python
+>>> s.chords(per="bar")
+[{'section': 'A', 'at': 'bar 1 beat 1', 'beats': 4.0, 'chord': 'C'},
+ {'section': 'A', 'at': 'bar 2 beat 1', 'beats': 4.0, 'chord': 'G7'}]
+```
+
+`report()`
+exists so an agent can check its own work programmatically. Each voice
+in it carries a pitch-class histogram, its out-of-key rate, the
+distribution of melodic intervals, bar-to-bar self-similarity, and a
+grace-note count, and its duration integrates the full tempo map:
 
 ```python
 assert s.report()["duration_s"] < 180
@@ -205,6 +296,24 @@ accompaniment on strong beats will trip the parallel checks on
 purpose; read the findings, keep the ones that are idiom, fix the
 ones that are accidents. When a texture doubles by design, pass
 `lint(mode="homophonic")` to keep only the collisions.
+
+## Engraving
+
+```python
+s.to_lilypond("piece.ly")   # then: lilypond piece.ly
+```
+
+`to_lilypond()` writes the song as LilyPond source, a text score that
+diffs as well as it typesets: one staff per voice role across the
+arrangement, with keys, meters, tempo marks, *rit.* and *accel.*,
+pickups, chords, ties, tuplets of any size, grace notes, dynamics and
+hairpins, accents, tenuto, staccato, fermatas, arpeggios, trills, and
+notated pedaling. Notes engrave as they were written, E-flat as
+E-flat and D-sharp as D-sharp, and `song.transpose()` respells them by
+the interval; notes from `harmony()` take the key's spelling. A drum
+voice engraves on a drum staff.
+`Song(title=, composer=)` fills the header, and the MIDI file carries
+the title as its track name, which the jukebox shows.
 
 ## Raw access
 
@@ -218,15 +327,25 @@ for tick, kind, ch, a, b in song.events():
     ...            # kind in {"on", "off", "cc64", "cc67", "tempo"}
 ```
 
+Each key is well formed on its channel. A note is released no later
+than the next strike of the same pitch, so a legato, fermata, or swung
+note never silences the note after it, and strikes of one key at one
+tick merge into one.
+
 `Song`, `Voice`, the transforms, and the renderer are ordinary Python,
 importable a la carte; a `Voice`'s `notes` list accepts hand-built
 `Note` objects, which bypass notation validation.
 
-Two query helpers answer "what notes are in this?" without a Song, so
-an agent can reason about harmony directly: `chord_pitches("Cmaj9")`
+Query helpers answer "what notes are in this?" without a Song, so an
+agent can reason about harmony directly: `chord_pitches("Cmaj9")`
 returns the MIDI pitches of a chord symbol (slash bass first when
 present), and `scale_pitches("Am")` returns the seven pitches of a
-key's diatonic scale, ascending from the tonic.
+key's diatonic scale, ascending from the tonic. `note_pitch("c#5")`
+and `note_name(61, key="Dm")` convert between written notes and MIDI
+numbers for scores built programmatically; `note_name` spells for the
+key (C-sharp as the leading tone of D minor, E-flat as its
+Neapolitan) and writes the accidental explicitly, `n` for a natural,
+so the name reads the same under any signature.
 
 ## Playback
 
@@ -258,6 +377,18 @@ widen it for synths with `Song(pitch_range=(0, 127))`.
 | `examples/blues_416_megabytes.py` | swing, grace notes, stride, rubato |
 | `examples/invention_two_processes.py` | motif transforms, two-voice counterpoint, lint |
 | `examples/orrery.py` | process music: prime-period orbits, overtone pitches |
+| `examples/rachmaninoff_prelude_bells.py` | a bell prelude after Rachmaninoff: fff motto chords, a chorale over a lament bass, triplet agitato, a soft-pedal coda |
+| `examples/horowitz_valse_brillante.py` | a virtuoso waltz after Horowitz: an octave variation with runs, a repeated-note episode, a three-hand trio, a chromatic cadenza, an octave coda |
+| `examples/rachmaninoff_elegie.py` | an elegy after Rachmaninoff: a line-cliché bass, a Neapolitan climax, the melody returned in the cello register under syncopated chords |
+| `examples/horowitz_gypsy_variations.py` | variations on a gypsy dance after Horowitz's Carmen Variations: sixths, a three-hand tremolo, a nocturne, double thirds, a music box, a Presto, generated from one theme |
+| `examples/rachmaninoff_prelude_alla_marcia.py` | a march prelude after Rachmaninoff: arpeggios figured with `harmony(pattern=)`, a real fermata, repeated groups, notated pedaling |
+| `examples/horowitz_grand_march.py` | a Sousa-style march transcribed after Horowitz: a trombone strain, a piccolo obbligato, a dogfight break, a grandioso with a bass countermelody |
+| `examples/rachmaninoff_etude_tableau.py` | a sonata-shaped étude-tableau after Rachmaninoff: a development sequenced with `transpose()`, bell chords over a falling bass, written in D minor and moved to E-flat minor with `song.transpose()` |
+| `examples/horowitz_rhapsodie_hongroise.py` | a Hungarian rhapsody after Horowitz's Liszt: a recitative on the Hungarian minor, a verbunkos lassan under a cimbalom tremolo, a friska through four variations to a Prestissimo |
+| `examples/rachmaninoff_sonata_movement.py` | a sonata first movement after Rachmaninoff's Second: exposition, closing group, a development sequenced by whole steps, a recapitulation with the second theme in the major, a Più mosso coda |
+| `examples/horowitz_opera_fantasy.py` | an operatic paraphrase after Horowitz: an aria under a filigree, a chorus, a love duet, a galop, and a stretta that sets the aria in the bass beneath the galop |
+| `examples/rachmaninoff_folia_variations.py` | eleven variations on La Folia after Rachmaninoff's Corelli Variations: a chorale voiced by dynamic programming against the bass, a three-voice fugato clean under full `lint()`, quintuplets, hemiolas, and the theme inverted in D-flat major |
+| `examples/horowitz_danse_macabre.py` | a Danse macabre on the Dies irae after Horowitz: midnight, a waltz and its variations, the chant voiced by `harmonize()` over a lament bass and as a chorale, a fugato held to `lint(only=)`, a cadenza, and the cock-crow at dawn |
 
 Running an example writes its `.mid` next to it; add `--play` to
 perform it on a connected MIDI output.
@@ -290,7 +421,9 @@ playlists (the GUI's Genre and Category menus).
 
 It prefers a real instrument port and warns when only a MIDI loopback
 is available (which makes no sound). Real output needs `python-rtmidi`.
-Re-launching is instant, since scores already rendered are not rebuilt.
+Re-launching is instant: a score is rebuilt only when its script has
+changed or its MIDI output has gone missing, and a script that fails
+reports the last line it printed.
 
 To play an instrument attached to another machine, run the jukebox on
 the far side too:
@@ -304,8 +437,28 @@ The `--remote` side streams each MIDI message over TCP to the
 `--forward` side, which relays it to a local port; the driving machine
 needs no MIDI hardware or backend, only `mido` to parse the scores.
 The forwarder re-selects the instrument on each connection, so it may
-start before the instrument is powered on, and it releases every note
-if the client drops.
+start before the instrument is powered on. The newest connection takes
+the instrument: a jukebox that connects while another holds it
+displaces the old one, and the displaced jukebox reconnects at its
+next play. Every departure releases all notes and both pedals,
+including a client that vanishes without closing its connection,
+which keepalive probes detect within about 25 seconds.
+
+## MCP server
+
+`mcp_server.py` exposes scoremill to an MCP client such as Claude Code
+or Claude Desktop. Each build tool takes a JSON song spec, whose shape
+is in the server's docstring, and returns the report, the lint
+findings, a saved MIDI file, the LilyPond source, the raw event
+stream, or the chord analysis (`harmony_analysis`); `transform`,
+`harmonize_melody`, `chords`, `scale`, and `cheatsheet` cover the
+motif transforms and query helpers. A `CompositionError` comes back as
+`{"error": ...}`.
+
+```
+pip install "scoremill[mcp]"
+claude mcp add --scope user scoremill -- python /path/to/mcp_server.py
+```
 
 ## License
 
