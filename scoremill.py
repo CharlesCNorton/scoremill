@@ -210,8 +210,9 @@ RELATIVE_MAJOR = {
     "Dm": "F", "Gm": "Bb", "Cm": "Eb", "Fm": "Ab", "Bbm": "Db",
     "Ebm": "Gb",
 }
-DUR = {"w": 4.0, "h": 2.0, "q": 1.0, "e": 0.5, "s": 0.25, "t": 0.125}
-DUR_ORDER = "whqest"
+DUR = {"w": 4.0, "h": 2.0, "q": 1.0, "e": 0.5, "s": 0.25, "t": 0.125,
+       "x": 0.0625}
+DUR_ORDER = "whqestx"
 DYN = {"ppp": 18, "pp": 28, "p": 38, "mp": 48, "mf": 58, "f": 70,
        "ff": 84, "fff": 96}
 
@@ -235,7 +236,8 @@ _LY_DUR = {4.0: "1", 6.0: "1.", 2.0: "2", 3.0: "2.", 1.0: "4", 1.5: "4.",
            0.5: "8", 0.75: "8.", 0.25: "16", 0.375: "16.", 0.125: "32",
            0.1875: "32.", 0.0625: "64", 0.09375: "64.", 7.0: "1..",
            3.5: "2..", 1.75: "4..", 0.875: "8..", 0.4375: "16..",
-           0.21875: "32.."}
+           0.21875: "32..", 0.109375: "64..", 0.03125: "128",
+           0.046875: "128.", 0.0546875: "128.."}
 
 # LilyPond drum-mode names for the General MIDI percussion notes in DRUMS.
 _LY_DRUM = {35: "bda", 36: "bd", 37: "ss", 38: "sn", 39: "hc", 40: "sne",
@@ -275,12 +277,14 @@ CHORD_QUALITY = {
 }
 
 MARKS = "~>'_^&%"
-DUR_RX = r"[whqest]\.{0,2}"            # a duration letter, up to two dots
+DUR_RX = r"[whqestx]\.{0,2}"           # a duration letter, up to two dots
 NOTE_RE = re.compile(
     r"^([a-gr])(##|bb|#|b|n)?(\d)?(" + DUR_RX + r")?([" + MARKS + r"]*)$")
 CHORD_RE = re.compile(
     r"^\[([^\]]+)\](" + DUR_RX + r")?([" + MARKS + r"]*)$")
-TUPLET_RE = re.compile(r"^\{([^}]+)\}(" + DUR_RX + r")?$")
+TUPLET_RE = re.compile(r"^\{(.+)\}(" + DUR_RX + r")?$", re.S)
+METER_RE = re.compile(r"^M:(\d+)/(\d+)$")     # a meter change: M:3/4
+_TUPLET_IDS = itertools.count(1)              # tuplet group ids, for engraving
 GROUP_RE = re.compile(r"\(([^()]*)\)\*(\d+)")
 REPEAT_RE = re.compile(r"^(.+)\*(\d+)$")
 PEDAL_MARKS = ("ped", "lift")
@@ -482,6 +486,18 @@ def _dur_value(durtok: str) -> float:
     return DUR[durtok[0]] * (2 - 0.5 ** durtok.count("."))
 
 
+def _meter_beats(time: str) -> float:
+    """Quarter-note beats in a bar of a time signature ('6/8' is 3.0),
+    rejecting one MIDI cannot state (a denominator not a power of two)."""
+    m = re.match(r"^(\d+)/(\d+)$", str(time).strip())
+    if not m or int(m.group(1)) < 1 or int(m.group(2)) not in (
+            1, 2, 4, 8, 16, 32, 64):
+        raise CompositionError(
+            f"bad time signature {time!r} — write it like '3/4' or '6/8', "
+            f"the denominator a power of two")
+    return int(m.group(1)) * 4.0 / int(m.group(2))
+
+
 def _beats_name(x: float) -> str | None:
     """Return the duration-letter name for a beat value, if exact."""
     for sym, val in DUR.items():
@@ -530,9 +546,42 @@ def _tokenize(text: str) -> list[str]:
         raise CompositionError(
             "unbalanced group: write a repeated group as '(c4e d4e)*3'")
     toks = []
-    for tok in re.findall(r"\{[^}]*\}\S*|\[[^\]]*\]\S*|\S+", text):
+    for tok in _split(text):
         m = REPEAT_RE.match(tok)
         toks.extend([m.group(1)] * _times(m.group(2)) if m else [tok])
+    return toks
+
+
+def _split(text: str) -> list[str]:
+    """Split notation on whitespace, keeping a tuplet (whose braces may
+    nest) or a chord whole, with the duration and marks after it."""
+    toks, i, n = [], 0, len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+            continue
+        j = i
+        if text[i] == "{":
+            depth = 0
+            while j < n:
+                depth += {"{": 1, "}": -1}.get(text[j], 0)
+                if depth == 0:
+                    break
+                j += 1
+            if j >= n:
+                raise CompositionError(
+                    f"unbalanced tuplet braces in '{text[i:i + 40]}'")
+            j += 1
+        elif text[i] == "[":
+            j = text.find("]", i)
+            if j < 0:
+                raise CompositionError(
+                    f"unbalanced chord bracket in '{text[i:i + 40]}'")
+            j += 1
+        while j < n and not text[j].isspace() and text[j] not in "{[":
+            j += 1
+        toks.append(text[i:j])
+        i = j
     return toks
 
 
@@ -553,6 +602,8 @@ def _classify(tok: str):
         return "cresc", None, False
     if tok in PEDAL_MARKS:
         return "pedal", None, False
+    if METER_RE.match(tok):
+        return "meter", None, False
     grace = tok.startswith("+")
     body = tok[1:] if grace else tok
     tm = TUPLET_RE.match(body)
@@ -598,7 +649,7 @@ def _transform(frag, fn):
     state = {"oct": 4}
     out = []
     for tok in _tokenize(frag):
-        if _classify(tok)[0] in ("bar", "dyn", "cresc", "pedal"):
+        if _classify(tok)[0] in ("bar", "dyn", "cresc", "pedal", "meter"):
             out.append(tok)
             continue
         out.append(_map_note_token(tok, fn, state))
@@ -698,6 +749,27 @@ def double(frag: str, degrees: int = 7) -> str:
             names += [n for n in members(nm) if n not in names]
         return "[" + " ".join(names) + "]"
 
+    def tuplet_of(tok):
+        """A tuplet with each member doubled, nested tuplets included."""
+        tm = TUPLET_RE.match(tok)
+        parts = []
+        for t in _tokenize(tm.group(1)):
+            cm, nm = CHORD_RE.match(t), NOTE_RE.match(t)
+            if TUPLET_RE.match(t):
+                parts.append(tuplet_of(t))
+            elif cm:
+                parts.append(chord_of(cm.group(1), tok)
+                             + (cm.group(2) or "") + (cm.group(3) or ""))
+            elif nm and nm.group(1) == "r":
+                parts.append(t)
+            elif nm:
+                parts.append("[" + " ".join(members(nm)) + "]"
+                             + (nm.group(4) or "") + (nm.group(5) or ""))
+            else:
+                raise CompositionError(
+                    f"double: bad tuplet member '{t}' in {tok}")
+        return "{" + " ".join(parts) + "}" + (tm.group(2) or "")
+
     out = []
     for tok in _tokenize(frag):
         anchor = ""
@@ -705,7 +777,7 @@ def double(frag: str, degrees: int = 7) -> str:
             tok, _, at = tok.partition("@")
             anchor = "@" + at
         kind, m, grace = _classify(tok)
-        if kind in ("bar", "dyn", "cresc", "pedal"):
+        if kind in ("bar", "dyn", "cresc", "pedal", "meter"):
             out.append(tok)
             continue
         if grace:
@@ -718,23 +790,7 @@ def double(frag: str, degrees: int = 7) -> str:
                        f"{nm.group(5) or ''}{anchor}")
             continue
         if kind == "tuplet":
-            parts = []
-            for t in _tokenize(m.group(1)):
-                cm = CHORD_RE.match(t)
-                nm = NOTE_RE.match(t)
-                if cm:
-                    parts.append(chord_of(cm.group(1), tok)
-                                 + (cm.group(2) or "") + (cm.group(3) or ""))
-                elif nm and nm.group(1) == "r":
-                    parts.append(t)
-                elif nm:
-                    parts.append("[" + " ".join(members(nm)) + "]"
-                                 + (nm.group(4) or "") + (nm.group(5) or ""))
-                else:
-                    raise CompositionError(
-                        f"double: bad tuplet member '{t}' in {tok}")
-            out.append("{" + " ".join(parts) + "}" + (m.group(2) or "")
-                       + anchor)
+            out.append(tuplet_of(tok) + anchor)
         elif kind == "chord":
             out.append(chord_of(m.group(1), tok) + (m.group(2) or "")
                        + (m.group(3) or "") + anchor)
@@ -775,23 +831,32 @@ def _timed(frag: str, key: str) -> list:
             state["dur"] = _dur_value(durtok)
         return state["dur"]
 
+    def members(inner):
+        """The pitches of a tuplet's members, nested tuplets included."""
+        ps = []
+        for mem in _tokenize(inner):
+            tm, cm, nm = (TUPLET_RE.match(mem), CHORD_RE.match(mem),
+                          NOTE_RE.match(mem))
+            if tm:
+                ps += members(tm.group(1))
+            elif cm:
+                ps += [pitch(NOTE_RE.match(x)) for x in cm.group(1).split()]
+            elif nm is None or nm.group(1) != "r":
+                ps.append(pitch(nm))
+        return ps
+
     for tok in _tokenize(frag):
         base, beats, ps = tok, 0.0, []
         if "@" in tok and not tok.startswith("!"):
             base, _, at = tok.partition("@")
             t = max(t, float(at))
         kind, m, grace = _classify(base)
-        if kind in ("bar", "dyn", "cresc", "pedal"):
+        if kind in ("bar", "dyn", "cresc", "pedal", "meter"):
             pass
         elif grace:
             kind, ps = "grace", [pitch(NOTE_RE.match(base[1:]))]
         elif kind == "tuplet":
-            for mem in _tokenize(m.group(1)):
-                cm, nm = CHORD_RE.match(mem), NOTE_RE.match(mem)
-                if cm:
-                    ps += [pitch(NOTE_RE.match(x)) for x in cm.group(1).split()]
-                elif nm is None or nm.group(1) != "r":
-                    ps.append(pitch(nm))
+            ps = members(m.group(1))
             beats = dur(m.group(2))
         elif kind == "chord":
             ps = [pitch(NOTE_RE.match(x)) for x in m.group(1).split()]
@@ -955,8 +1020,9 @@ def retro(frag: str) -> str:
     change what any token means. Barlines, dynamics, and ties are not
     permitted inside; strip them and reapply around the result."""
     toks = _tokenize(frag)
-    if "|" in toks:
-        raise CompositionError("retro: remove barlines from the fragment")
+    if "|" in toks or any(METER_RE.match(t) for t in toks):
+        raise CompositionError(
+            "retro: remove barlines and meter changes from the fragment")
     for t in toks:
         if t.startswith("!") or t in ("cresc", "dim") or t in PEDAL_MARKS:
             raise CompositionError(
@@ -992,6 +1058,27 @@ def retro(frag: str) -> str:
             parts.append(explicit_pitch(nm))
         return parts
 
+    def reversed_members(inner, tok):
+        """A tuplet's members reversed, nested tuplets reversed within."""
+        members = []
+        for t in _tokenize(inner):
+            mc, mt = CHORD_RE.match(t), TUPLET_RE.match(t)
+            if mt:
+                members.append("{" + " ".join(reversed_members(mt.group(1),
+                                                               tok)) + "}")
+            elif mc:
+                members.append(
+                    "[" + " ".join(chord_members(mc.group(1), tok))
+                    + "]" + (mc.group(2) or "") + (mc.group(3) or ""))
+            else:
+                mn = NOTE_RE.match(t)
+                if not mn:
+                    raise CompositionError(
+                        f"retro: bad tuplet member '{t}' in {tok}")
+                members.append(explicit_pitch(mn)
+                               + (mn.group(4) or "") + (mn.group(5) or ""))
+        return list(reversed(members))
+
     units = []                     # each unit: [grace..., principal]
     graces = []
     for tok in toks:
@@ -1003,21 +1090,7 @@ def retro(frag: str) -> str:
             continue
         kind, m, _grace = _classify(tok)
         if kind == "tuplet":
-            members = []
-            for t in _tokenize(m.group(1)):
-                mc = CHORD_RE.match(t)
-                if mc:
-                    members.append(
-                        "[" + " ".join(chord_members(mc.group(1), tok))
-                        + "]" + (mc.group(2) or "") + (mc.group(3) or ""))
-                else:
-                    mn = NOTE_RE.match(t)
-                    if not mn:
-                        raise CompositionError(
-                            f"retro: bad tuplet member '{t}' in {tok}")
-                    members.append(explicit_pitch(mn)
-                                   + (mn.group(4) or "") + (mn.group(5) or ""))
-            out = ("{" + " ".join(reversed(members)) + "}"
+            out = ("{" + " ".join(reversed_members(m.group(1), tok)) + "}"
                    + explicit_dur(m.group(2)))
         elif kind == "chord":
             out = ("[" + " ".join(chord_members(m.group(1), tok)) + "]"
@@ -1045,7 +1118,7 @@ for _sym, _val in DUR.items():
 def stretch(frag: str, factor: float) -> str:
     """Scale every duration by `factor`: any positive number, with 2
     augmenting and 0.5 diminishing. Each resulting duration must be
-    spellable as one of w h q e s t, with up to two dots; a factor that
+    spellable as one of w h q e s t x, with up to two dots; a factor that
     lands a note on a value that cannot be written is rejected, naming
     the offending note and its would-be duration."""
     if factor <= 0:
@@ -1059,7 +1132,7 @@ def stretch(frag: str, factor: float) -> str:
         if name is None:
             raise CompositionError(
                 f"stretch by {factor}: '{tok}' would become {new} beats, "
-                f"which is not spellable as w/h/q/e/s/t (dotted at most "
+                f"which is not spellable as w/h/q/e/s/t/x (dotted at most "
                 f"twice) — choose a factor whose result lands on a real "
                 f"duration")
         return name
@@ -1067,7 +1140,7 @@ def stretch(frag: str, factor: float) -> str:
     out = []
     for tok in _tokenize(frag):
         kind, m, grace = _classify(tok)
-        if kind in ("bar", "dyn", "cresc", "pedal"):
+        if kind in ("bar", "dyn", "cresc", "pedal", "meter"):
             out.append(tok)
             continue
         pre = "+" if grace else ""
@@ -1088,7 +1161,8 @@ def stretch(frag: str, factor: float) -> str:
 
 def rebar(frag: str, beats_per_bar: float) -> str:
     """Insert barlines every `beats_per_bar` beats, honoring sticky
-    durations, dots, tuplets, chords, graces, and dynamics tokens.
+    durations, dots, tuplets, chords, graces, and dynamics tokens; a
+    meter change (M:3/4) at a bar start sets the bar length from there.
     Errors if a token would cross a barline or the fragment does not
     end on one."""
     toks = _tokenize(frag)
@@ -1106,6 +1180,13 @@ def rebar(frag: str, beats_per_bar: float) -> str:
     for tok in toks:
         beats = 0.0
         kind, m, grace = _classify(tok)
+        if kind == "meter":
+            if filled > 1e-9:
+                raise CompositionError(
+                    f"rebar: meter change '{tok}' falls inside a bar")
+            beats_per_bar = _meter_beats(tok[2:])
+            out.append(tok)
+            continue
         if kind in ("dyn", "cresc", "pedal") or grace:
             pass                      # marks and grace notes carry no time
         elif kind == "tuplet":
@@ -1141,14 +1222,16 @@ class Note:
     `trill` marks the notes a trill expands into; `marks` keeps the
     written articulation marks for engraving; `spell` keeps each pitch's
     written (letter, alteration, octave), so the engraving shows E-flat
-    where E-flat was written."""
+    where E-flat was written; `tup` is the path of tuplets enclosing the
+    note, outermost first, each (group id, members, span in beats)."""
     __slots__ = ("pitches", "beats", "vel", "gate", "tie", "grace",
-                 "roll", "trill", "hold", "marks", "spell")
+                 "roll", "trill", "hold", "marks", "spell", "tup")
 
     def __init__(self, pitches: list[int], beats: float, vel: int,
                  gate: float = 0.92, tie: bool = False, grace: bool = False,
                  roll: bool = False, trill: bool = False, hold: bool = False,
-                 marks: str = "", spell: list | None = None):
+                 marks: str = "", spell: list | None = None,
+                 tup: tuple = ()):
         self.pitches = pitches
         self.beats = beats
         self.vel = vel
@@ -1160,6 +1243,7 @@ class Note:
         self.hold = hold
         self.marks = marks
         self.spell = spell
+        self.tup = tup
 
 
 def _suggest(raw: str) -> str:
@@ -1209,6 +1293,32 @@ class Voice:
         self.dyn_marks = {}        # note index -> dynamic, for engraving
         self.hairpins = {}         # note index -> "<" or ">"
         self._spelled = []         # written spellings awaiting their Note
+        self.barlines = []         # beat of each barline written in bars()
+        self._bars_done = 0        # full bars written, after any pickup
+        self._pickup_first = False  # the voice opened with a pickup bar
+
+    def _bar_length(self, number: int) -> float:
+        """Beats in bar `number` (1 = the first full bar) under the
+        section's meters."""
+        if self.section is not None:
+            return self.section._meter_at(number)[0]
+        return self.bpb
+
+    def _declare_meter(self, bar: int, time: str) -> None:
+        """Record a meter change a voice writes inline (M:3/4) with its
+        section, where every voice shares it; voices may repeat a change
+        but not contradict one."""
+        if self.section is None:
+            raise CompositionError(
+                f"voice '{self.name}': a meter change needs a section")
+        _meter_beats(time)
+        have = self.section.meters.get(bar)
+        if have is not None and have != time:
+            raise CompositionError(
+                f"voice '{self.name}' changes the meter to {time} at bar "
+                f"{bar}, where its section already changes to {have}")
+        self.section.meters[bar] = time
+        self.song._dirty()
 
     def absolute_onsets(self, on: bool = True) -> "Voice":
         """Opt this voice into absolute-onset anchors. A note may then
@@ -1224,14 +1334,15 @@ class Voice:
     def bars(self, text: str) -> "Voice":
         self.song._dirty()
         beats_in_bar = 0.0
-        bar_no = 1
         first_bar = not self._started
         bar_tokens = []
         for raw in _tokenize(text):
             if raw == "|":
-                want = self.bpb
-                if (first_bar and self.song.pickup
-                        and abs(beats_in_bar - self.song.pickup) <= 1e-6):
+                number = self._bars_done + 1
+                want = self._bar_length(number)
+                pickup = bool(first_bar and self.song.pickup and abs(
+                    beats_in_bar - self.song.pickup) <= 1e-6)
+                if pickup:
                     want = self.song.pickup
                 if abs(beats_in_bar - want) > 1e-6:
                     diff = want - beats_in_bar
@@ -1246,16 +1357,27 @@ class Voice:
                             f"also legal here)"
                             if first_bar and self.song.pickup else "")
                     raise CompositionError(
-                        f"voice '{self.name}' bar {bar_no}: has "
+                        f"voice '{self.name}' bar {number}: has "
                         f"{beats_in_bar} beats, expected {want} — {how}."
                         f"{hint}\n    bar was: {' '.join(bar_tokens)}")
-                bar_no += 1
+                if pickup:
+                    self._pickup_first = True
+                else:
+                    self._bars_done += 1
+                self.barlines.append(self.total_beats())
                 beats_in_bar = 0.0
                 bar_tokens = []
                 first_bar = False
                 self._started = True
                 continue
             bar_tokens.append(raw)
+            if METER_RE.match(raw):
+                if beats_in_bar > 1e-6:
+                    raise CompositionError(
+                        f"voice '{self.name}': the meter change '{raw}' "
+                        f"must open a bar — put it after the barline")
+                self._declare_meter(self._bars_done + 1, raw[2:])
+                continue
             if raw in PEDAL_MARKS:
                 self.pedal_marks.append((self.total_beats(), raw))
                 continue
@@ -1397,60 +1519,8 @@ class Voice:
         kind, match, _grace = _classify(raw)
         tm = match if kind == "tuplet" else None
         if tm:
-            inner, durtok = tm.group(1), tm.group(2)
-            members = _tokenize(inner)
-            if not members:
-                raise CompositionError(f"empty tuplet '{raw}'")
-            span = self._beats(durtok)
-            each = span / len(members)
-            for t in members:
-                cm = CHORD_RE.match(t)
-                if cm:
-                    if cm.group(2):
-                        raise CompositionError(
-                            f"tuplet member '{t}' must not carry a "
-                            f"duration — the span divides equally")
-                    if (cm.group(3) or "").replace("~", ""):
-                        raise CompositionError(
-                            f"tuplet member '{t}' in {raw}: only a tie "
-                            f"'~' may mark a tuplet member")
-                    pitches = []
-                    for ct in cm.group(1).split():
-                        cn = NOTE_RE.match(ct)
-                        if not cn or cn.group(1) == "r":
-                            raise CompositionError(
-                                f"bad chord member '{ct}' in tuplet {raw}")
-                        if cn.group(4) or cn.group(5):
-                            raise CompositionError(
-                                f"chord member '{ct}' in tuplet {raw} "
-                                f"must not carry a duration or marks")
-                        pitches.append(self._pitch(cn))
-                    self.notes.append(Note(pitches, each, self._vel,
-                                           gate=0.9,
-                                           tie="~" in (cm.group(3) or ""),
-                                           spell=self._take_spell()))
-                    continue
-                nm = NOTE_RE.match(t)
-                if not nm:
-                    raise CompositionError(
-                        f"bad tuplet member '{t}' in {raw} (no duration "
-                        f"letters inside tuplets)")
-                if nm.group(4):
-                    raise CompositionError(
-                        f"tuplet member '{t}' must not carry a duration — "
-                        f"the span '{durtok or 'sticky'}' divides equally")
-                if (nm.group(5) or "").replace("~", ""):
-                    raise CompositionError(
-                        f"tuplet member '{t}' in {raw}: only a tie '~' "
-                        f"may mark a tuplet member")
-                if nm.group(1) == "r":
-                    self.notes.append(Note([], each, 0))
-                else:
-                    self.notes.append(Note([self._pitch(nm)], each,
-                                           self._vel,
-                                           gate=0.9,
-                                           tie="~" in (nm.group(5) or ""),
-                                           spell=self._take_spell()))
+            span = self._beats(tm.group(2))
+            self._tuplet(tm.group(1), span, raw, ())
             return span
         m = match if kind == "chord" else None
         if m:
@@ -1487,6 +1557,71 @@ class Voice:
         else:
             self._push([self._pitch(m)], beats, m.group(5) or "")
         return beats
+
+    def _tuplet(self, inner: str, span: float, raw: str, path: tuple) -> None:
+        """Divide `span` beats equally among a tuplet's members: notes,
+        rests, chords, or tuplets of their own ({c4 {d4 e4 f4} g4}q),
+        which divide their member's share in turn. Each Note keeps the
+        path of groups enclosing it, for engraving."""
+        members = _tokenize(inner)
+        if not members:
+            raise CompositionError(f"empty tuplet '{raw}'")
+        each = span / len(members)
+        path = path + ((next(_TUPLET_IDS), len(members), span),)
+        for t in members:
+            tm = TUPLET_RE.match(t)
+            if tm:
+                if tm.group(2):
+                    raise CompositionError(
+                        f"nested tuplet '{t}' in {raw} must not carry a "
+                        f"duration — it takes its member's share")
+                self._tuplet(tm.group(1), each, raw, path)
+                continue
+            cm = CHORD_RE.match(t)
+            if cm:
+                if cm.group(2):
+                    raise CompositionError(
+                        f"tuplet member '{t}' must not carry a "
+                        f"duration — the span divides equally")
+                if (cm.group(3) or "").replace("~", ""):
+                    raise CompositionError(
+                        f"tuplet member '{t}' in {raw}: only a tie "
+                        f"'~' may mark a tuplet member")
+                pitches = []
+                for ct in cm.group(1).split():
+                    cn = NOTE_RE.match(ct)
+                    if not cn or cn.group(1) == "r":
+                        raise CompositionError(
+                            f"bad chord member '{ct}' in tuplet {raw}")
+                    if cn.group(4) or cn.group(5):
+                        raise CompositionError(
+                            f"chord member '{ct}' in tuplet {raw} "
+                            f"must not carry a duration or marks")
+                    pitches.append(self._pitch(cn))
+                self.notes.append(Note(pitches, each, self._vel, gate=0.9,
+                                       tie="~" in (cm.group(3) or ""),
+                                       spell=self._take_spell(), tup=path))
+                continue
+            nm = NOTE_RE.match(t)
+            if not nm:
+                raise CompositionError(
+                    f"bad tuplet member '{t}' in {raw} (no duration "
+                    f"letters inside tuplets)")
+            if nm.group(4):
+                raise CompositionError(
+                    f"tuplet member '{t}' must not carry a duration — "
+                    f"the span divides equally")
+            if (nm.group(5) or "").replace("~", ""):
+                raise CompositionError(
+                    f"tuplet member '{t}' in {raw}: only a tie '~' "
+                    f"may mark a tuplet member")
+            if nm.group(1) == "r":
+                self.notes.append(Note([], each, 0, tup=path))
+            else:
+                self.notes.append(Note([self._pitch(nm)], each, self._vel,
+                                       gate=0.9,
+                                       tie="~" in (nm.group(5) or ""),
+                                       spell=self._take_spell(), tup=path))
 
     def _take_spell(self):
         """The written spellings gathered since the last Note, handed
@@ -1665,13 +1800,28 @@ class Voice:
             raise CompositionError(
                 "harmony: voicing is plain, smooth, shell, rootless, "
                 f"or drop2 (got {voicing!r})")
-        if slots == "bar":
-            slot_beats = self.bpb
-        elif slots == "half":
-            slot_beats = self.bpb / 2
-        elif (isinstance(slots, (int, float)) and not isinstance(slots, bool)
-              and slots > 0):
-            slot_beats = float(slots)
+        if (isinstance(slots, (int, float)) and not isinstance(slots, bool)
+                and slots > 0):
+            def slot_at(_t):
+                return float(slots)
+        elif slots in ("bar", "half"):
+            anac = self.song.pickup if (
+                self._pickup_first or (self.notes
+                                       and self.notes[0].marks == "pickup")
+            ) else 0.0
+
+            def slot_at(t):
+                """The rest of the bar (or half bar) that beat t is in,
+                under the section's meters."""
+                pos, number = anac, 1
+                while True:
+                    beats = self._bar_length(number)
+                    if t < pos + beats - 1e-9:
+                        break
+                    pos, number = pos + beats, number + 1
+                if slots == "half" and t < pos + beats / 2 - 1e-9:
+                    return pos + beats / 2 - t
+                return pos + beats - t
         else:
             raise CompositionError(
                 f'harmony: slots is "bar", "half", or a positive number of '
@@ -1693,6 +1843,7 @@ class Voice:
             elif voicing == "smooth" and prev_voicing:
                 tones = [tones[0]] + self._lead(prev_voicing[1:], tones[1:])
             prev_voicing = tones
+            slot_beats = slot_at(t0)
             if steps is not None:
                 self._pattern(tones, has_bass, steps, unit, slot_beats, t0,
                               avoid_map)
@@ -1882,6 +2033,8 @@ class Voice:
     def _anacrusis(self) -> float:
         """Beats of pickup before this voice's first downbeat (0.0 when
         it opens on one), judged from its length."""
+        if self.section is not None:
+            return self.section._anacrusis_of(self.total_beats())
         return _pickup_of(self.total_beats(), self.song.pickup, self.bpb)
 
     def pitch_metrics(self) -> dict:
@@ -1908,6 +2061,8 @@ class Voice:
         intervals = {}
         for a, b in zip(tops, tops[1:]):
             intervals[b - a] = intervals.get(b - a, 0) + 1
+        bar_of = (self.section._bar_index(self.total_beats())
+                  if self.section is not None else None)
         anac = self._anacrusis()       # a pickup is bar 0, its own bar
         bar_pcs = {}
         t = 0.0
@@ -1915,7 +2070,8 @@ class Voice:
             if n.grace:
                 continue
             if n.pitches:
-                bar = int((t - anac + 1e-9) // self.bpb) + (1 if anac else 0)
+                bar = (bar_of(t) if bar_of else
+                       int((t - anac + 1e-9) // self.bpb) + (1 if anac else 0))
                 bar_pcs.setdefault(bar, set()).update(
                     p % 12 for p in n.pitches)
             t += n.beats
@@ -1937,12 +2093,9 @@ class Section:
         self.name = name
         self.song = song
         self.key = key
-        if time:
-            num, den = time.split("/")
-            self.bpb = float(num) * 4.0 / float(den)
-        else:
-            self.bpb = song.beats_per_bar
+        self.bpb = _meter_beats(time) if time else song.beats_per_bar
         self.time_sig = time or song.time_sig
+        self.meters = {}              # bar number -> time signature
         self.voices = []
         self.pedal_mode = None
         self.soft_pedal = False
@@ -2015,24 +2168,121 @@ class Section:
         self.song._dirty()
         return self
 
+    def time_change(self, bar: int, time: str) -> "Section":
+        """Change the meter from `bar` on, bar 1 being the first full
+        bar: time_change(5, "3/4"). A voice may write the same change
+        inline as M:3/4 at the start of that bar. Bar checks, bar
+        numbers, pedaling by the bar, harmony(slots="bar"), and the
+        engraving all follow the meters; harmony() sees the changes
+        declared before it runs."""
+        _meter_beats(time)
+        if int(bar) != bar or bar < 1:
+            raise CompositionError(
+                f"time_change: bar is a bar number from 1 (got {bar!r})")
+        self.meters[int(bar)] = time
+        self.song._dirty()
+        return self
+
+    def _meter_at(self, bar: int) -> tuple[float, str]:
+        """(beats per bar, time signature) in force at bar `bar`."""
+        time = self.time_sig
+        for b in sorted(self.meters):
+            if b > bar:
+                break
+            time = self.meters[b]
+        return _meter_beats(time), time
+
+    def _walk(self, start: float, length: float) -> tuple[list, bool]:
+        """The full bars from `start` up to `length` beats as (start,
+        beats, number, time), and whether the last ends exactly at
+        `length`."""
+        bars, pos, number = [], start, 1
+        while pos < length - 1e-9:
+            beats, time = self._meter_at(number)
+            bars.append((pos, beats, number, time))
+            pos += beats
+            number += 1
+        return bars, abs(pos - length) < 1e-6
+
+    def _anacrusis_of(self, length: float) -> float:
+        """The pickup a passage of `length` beats opens with: the song's
+        pickup when the passage is that pickup plus whole bars, else 0."""
+        pickup = self.song.pickup
+        if not pickup or self._walk(0.0, length)[1]:
+            return 0.0
+        return pickup if self._walk(pickup, length)[1] else 0.0
+
     def _anacrusis(self) -> float:
         """Beats of pickup before the section's first downbeat (0.0 when
         it opens on one), judged from the section's length."""
         sec_len = max((v.total_beats() for v in self.voices), default=0.0)
-        return _pickup_of(sec_len, self.song.pickup, self.bpb)
+        return self._anacrusis_of(sec_len)
+
+    def bar_grid(self, length: float | None = None) -> list[tuple]:
+        """The section's bars as (start beat, beats, bar number, time):
+        a pickup as bar 0 when the section opens with one, then the full
+        bars in the meters in force."""
+        if length is None:
+            length = max((v.total_beats() for v in self.voices), default=0.0)
+        anac = self._anacrusis_of(length)
+        bars = self._walk(anac, length)[0]
+        return ([(0.0, anac, 0, self.time_sig)] if anac else []) + bars
+
+    def _bar_index(self, length: float):
+        """A function mapping a beat to its bar number (0 for a pickup)."""
+        grid = self.bar_grid(length)
+
+        def bar_of(t):
+            number = 1
+            for start, _beats, n, _time in grid:
+                if t < start - 1e-9:
+                    break
+                number = n
+            return number
+        return bar_of
+
+    def _bar_position(self, length: float):
+        """A function mapping a beat to its fractional bar number, 1.0
+        at the first downbeat: bar 3 beat 2 of a 4/4 bar is 3.25. A
+        pickup counts back from 1.0, and beats past the end continue in
+        the last meter."""
+        grid = [g for g in self.bar_grid(length) if g[2] >= 1]
+        anac = self._anacrusis_of(length)
+
+        def position(t):
+            if not grid:
+                return 1.0 + (t - anac) / self.bpb
+            if t < grid[0][0]:
+                return 1.0 + (t - grid[0][0]) / grid[0][1]
+            for start, beats, number, _time in reversed(grid):
+                if t >= start - 1e-9:
+                    return number + (t - start) / beats
+            return 1.0
+        return position
+
+    def bar_count(self, length: float | None = None) -> float:
+        """Bars in the section, a pickup counting as its fraction of the
+        first full bar."""
+        grid = self.bar_grid(length)
+        full = [g for g in grid if g[2] >= 1]
+        pickup = grid[0][1] if grid and grid[0][2] == 0 else 0.0
+        first = full[0][1] if full else self.bpb
+        return len(full) + pickup / first
 
     def locate(self, t: float) -> str:
         """Render a section-relative beat offset as 'bar B beat N',
-        accounting for an anacrusis when the song has a pickup and this
-        section's voices begin with one."""
-        pu = self._anacrusis()
-        if pu:
-            if t < pu - 1e-9:
-                return f"pickup beat {t + 1:g}"
-            t -= pu
-        bar = int(round(t, 6) // self.bpb) + 1
-        beat = t - (bar - 1) * self.bpb + 1
-        return f"bar {bar} beat {beat:g}"
+        accounting for a pickup and for meter changes."""
+        grid = self.bar_grid()
+        if not grid:
+            return f"bar 1 beat {t + 1:g}"
+        start, _beats, number, _time = grid[0]
+        for g in grid:
+            if t < g[0] - 1e-9:
+                break
+            start, _beats, number, _time = g
+        if number == 0:
+            return f"pickup beat {t + 1:g}"
+        return f"bar {number} beat {round(t - start, 6) + 1:g}"
 
     def variant(self, name: str, vel_scale: float = 1.0) -> "Section":
         """Return a copy of this section with velocities scaled. The copy
@@ -2041,6 +2291,7 @@ class Section:
         notation state, so bars() may continue it."""
         clone = self.song.section(name, key=self.key, time=self.time_sig)
         clone.bpb = self.bpb
+        clone.meters = dict(self.meters)
         clone.pedal_mode = self.pedal_mode
         clone.soft_pedal = self.soft_pedal
         clone.rubato_depth = self.rubato_depth
@@ -2057,6 +2308,8 @@ class Section:
                        bpb=v.bpb, absolute=v.absolute, drums=v.drums)
             nv.section = clone
             nv._oct, nv._dur, nv._started = v._oct, v._dur, v._started
+            nv._bars_done, nv._pickup_first = v._bars_done, v._pickup_first
+            nv.barlines = list(v.barlines)
             nv._vel = scaled(v._vel)
             if v._cresc_from is not None:
                 nv._cresc_from = (v._cresc_from[0], scaled(v._cresc_from[1]))
@@ -2067,7 +2320,8 @@ class Section:
                 nv.notes.append(Note(list(n.pitches), n.beats, scaled(n.vel),
                                      n.gate, n.tie, n.grace, n.roll, n.trill,
                                      n.hold, n.marks,
-                                     list(n.spell) if n.spell else None))
+                                     list(n.spell) if n.spell else None,
+                                     n.tup))
             clone.voices.append(nv)
         self.song._dirty()
         return clone
@@ -2125,7 +2379,21 @@ class Section:
             pretty = {k: f"{x / self.bpb:.2f} bars" for k, x in lens.items()}
             raise CompositionError(
                 f"section '{self.name}': voices differ in length: {pretty}")
-        return next(iter(vals)) if vals else 0.0
+        length = next(iter(vals)) if vals else 0.0
+        if self.meters:
+            # a barline written before a meter change was declared must
+            # still fall where the section's meters put one
+            starts = {round(g[0], 4) for g in self.bar_grid(length)}
+            starts.add(round(length, 4))
+            for v in self.voices:
+                for pos in v.barlines:
+                    if round(pos, 4) not in starts:
+                        raise CompositionError(
+                            f"voice '{v.name}': a barline at beat {pos:g} "
+                            f"falls inside a bar of the section's meters "
+                            f"{self.meters} — rewrite the bars around the "
+                            f"meter change")
+        return length
 
 
 def _grid(total: int, anac: int, step: int) -> list[int]:
@@ -2247,8 +2515,7 @@ class Song:
                     f"{' '.join(DYN)}, velocities 1-127")
             self.levels[mark] = int(vel)
         self.tempo = tempo
-        num, den = time.split("/")
-        self.beats_per_bar = float(num) * 4.0 / float(den)
+        self.beats_per_bar = _meter_beats(time)
         self.time_sig = time
         _resolve_key(key)          # validate early
         self.key = key
@@ -2378,10 +2645,11 @@ class Song:
             return int((amount - 0.5) * period)
         return 0
 
-    def _base_bpm_fn(self, sec_name: str, sec: "Section", anac: int = 0):
+    def _base_bpm_fn(self, sec_name: str, barpos):
         # Steps and ramps apply in bar order, so a later instruction
         # overrides an earlier one: (start, kind, end, bpm), a step being
         # a ramp that ends where it starts; a step sorts first at a bar.
+        # `barpos` maps a beat to its fractional bar number.
         plan = sorted(
             [(bar, 0, bar, bpm) for (sn, bar), bpm
              in self._tempo_changes.items() if sn == sec_name]
@@ -2389,9 +2657,9 @@ class Song:
                if sn == sec_name])
 
         def at(pos_ticks):
-            # Bar 1 begins at the first downbeat, `anac` ticks in; a
-            # pickup before it plays at bar 1's tempo.
-            bar = max(1.0, (pos_ticks - anac) / (sec.bpb * TPB) + 1)
+            # Bar 1 begins at the first downbeat; a pickup before it
+            # plays at bar 1's tempo.
+            bar = max(1.0, barpos(pos_ticks / TPB))
             bpm = self.tempo
             for start, _kind, end, target in plan:
                 if bar < start:
@@ -2409,14 +2677,24 @@ class Song:
         repeated report()/events()/save() calls on an unchanged song do
         not re-render. A built-in mutator bumps the counter; a hand-built
         or hand-edited Note is caught by the fingerprint (see _render_sig)."""
+        return self._render(order)[1]
+
+    def _events_full(self, order=None):
+        """(events, cursor, roles): the memoized render, with the voice
+        role of each note event (None for pedal and tempo events), which
+        the multi-track MIDI file uses."""
+        return self._render(order)[0]
+
+    def _render(self, order):
         key = tuple(order) if order is not None else None
         sig = self._render_sig()
         hit = self._events_cache.get(key)
         if hit is not None and hit[0] == sig:
-            return hit[1]
-        result = self._compute_events(order)
-        self._events_cache[key] = (sig, result)
-        return result
+            return hit[1], hit[2]
+        full = self._compute_events(order)
+        pair = full[:2]
+        self._events_cache[key] = (sig, full, pair)
+        return full, pair
 
     def _compute_events(self, order=None):
         import math
@@ -2427,8 +2705,9 @@ class Song:
         bpm_now = self.tempo       # the tempo the stream has reached
         cursor = 0
 
-        def strike(on_t, off_t, ch, p, vel):
-            on, off = [on_t, "on", ch, p, vel], [off_t, "off", ch, p, 0]
+        def strike(on_t, off_t, ch, p, vel, role):
+            on = [on_t, "on", ch, p, vel, role]
+            off = [off_t, "off", ch, p, 0, role]
             events.extend((on, off))
             strikes.append((on, off))
 
@@ -2440,15 +2719,19 @@ class Song:
                     f"{list(self.sections)}")
             sec = self.sections[sec_name]
             sec_len = sec.length_beats()
-            bar_ticks = int(sec.bpb * TPB)
             end = round(sec_len * TPB)
             # Bar-relative effects (downbeat lean, swing, pedal changes,
             # tempo plans, rubato phrases) count from the first downbeat,
-            # which follows the pickup when the section opens with one.
-            anac = int(round(_pickup_of(sec_len, self.pickup, sec.bpb) * TPB))
+            # which follows the pickup when the section opens with one,
+            # and follow the section's meters.
+            grid = sec.bar_grid(sec_len)
+            anac = int(round(sec._anacrusis_of(sec_len) * TPB))
+            downbeats = {round(g[0] * TPB) for g in grid if g[2] >= 1}
+            barpos = sec._bar_position(sec_len)
             holds = []                 # section-relative spans under fermatas
             for v in sec.voices:
                 ch = v.channel
+                role = v.name.split(".", 1)[1]
                 sounding = [n for n in v.notes if n.pitches and not n.grace]
                 avg = (sum(p for n in sounding for p in n.pitches)
                        / max(1, sum(len(n.pitches) for n in sounding)))
@@ -2481,11 +2764,11 @@ class Song:
                             for gi, g in enumerate(reversed(pending_grace)):
                                 gt = max(cursor, start - 60 * (gi + 1))
                                 for p in g.pitches:
-                                    strike(gt, gt + 55, ch, p, g.vel)
+                                    strike(gt, gt + 55, ch, p, g.vel, role)
                             pending_grace = []
                             vel = n.vel
                             if self.expressive:
-                                if (start - cursor - anac) % bar_ticks == 0:
+                                if start - cursor in downbeats:
                                     vel += 3
                                 if not v.drums:
                                     top = max(n.pitches)
@@ -2516,22 +2799,28 @@ class Song:
                                         and p == max(n.pitches)):
                                     pv += 5
                                 strike(on_t + pi * spread, off_t, ch, p,
-                                       max(1, min(127, pv)))
+                                       max(1, min(127, pv)), role)
             chans = sorted({v.channel for v in sec.voices})
             if sec.pedal_mode:
                 if isinstance(sec.pedal_mode, (int, float)):
-                    step = max(1, int(sec.pedal_mode * TPB))
+                    marks = _grid(end, anac,
+                                  max(1, int(sec.pedal_mode * TPB)))
                 else:
-                    step = int(bar_ticks * (0.5 if sec.pedal_mode == "half"
-                                            else 1))
-                marks = _grid(end, anac, step)
+                    marks = {0} if anac else set()
+                    for start, beats, number, _time in grid:
+                        if number >= 1:
+                            marks.add(round(start * TPB))
+                            if sec.pedal_mode == "half":
+                                marks.add(round((start + beats / 2) * TPB))
+                    marks = sorted(m for m in marks if m < end)
                 # re-pedal just after each change and lift just before the
                 # next; the last lift falls inside the section
                 for a, b in zip(marks, marks[1:] + [end]):
                     for ch in chans:
-                        events.append((cursor + a + 10, "cc64", ch, 127, 0))
+                        events.append((cursor + a + 10, "cc64", ch, 127, 0,
+                                       None))
                         events.append((cursor + max(a + 10, b - 20),
-                                       "cc64", ch, 0, 0))
+                                       "cc64", ch, 0, 0, None))
             # notated pedaling: 'ped' changes (lift just before the note,
             # press just after), 'lift' releases; the section ends lifted
             down = False
@@ -2541,21 +2830,23 @@ class Song:
                 for ch in chans:
                     if down:
                         events.append((cursor + max(0, pos - 20), "cc64",
-                                       ch, 0, 0))
+                                       ch, 0, 0, None))
                     if kind == "ped":
-                        events.append((cursor + pos + 10, "cc64", ch, 127, 0))
+                        events.append((cursor + pos + 10, "cc64", ch, 127, 0,
+                                       None))
                 down = kind == "ped"
             if down:
                 for ch in chans:
-                    events.append((cursor + max(0, end - 20), "cc64", ch, 0, 0))
+                    events.append((cursor + max(0, end - 20), "cc64", ch, 0, 0,
+                                   None))
             if sec.soft_pedal:
                 for ch in chans:
-                    events.append((cursor + 5, "cc67", ch, 127, 0))
-                    events.append((cursor + end - 10, "cc67", ch, 0, 0))
+                    events.append((cursor + 5, "cc67", ch, 127, 0, None))
+                    events.append((cursor + end - 10, "cc67", ch, 0, 0, None))
             # Tempo: the section's plan and rubato beat by beat, divided by
             # Song(fermata=) under every fermata; a section with no plan of
             # its own returns to the song tempo.
-            bpm_at, has_plan = self._base_bpm_fn(sec_name, sec, anac)
+            bpm_at, has_plan = self._base_bpm_fn(sec_name, barpos)
             spans = _merge_spans(holds)
             points = (set(_grid(end, anac, TPB))
                       if sec.rubato_depth > 0 or has_plan else set())
@@ -2563,11 +2854,11 @@ class Song:
                 points.update(p for p in (a, b) if p < end)
             if abs(bpm_now - self.tempo) > 1e-9:
                 points.add(0)
-            phrase_ticks = int(sec.rubato_phrase * bar_ticks)
+            phrase = sec.rubato_phrase
             for pos in sorted(points):
                 bpm = bpm_at(pos)
                 if sec.rubato_depth > 0:
-                    x = ((pos - anac) % phrase_ticks) / phrase_ticks
+                    x = (round(barpos(pos / TPB) - 1.0, 9) % phrase) / phrase
                     bend = sec.rubato_depth * math.sin(math.pi * x)
                     mult = (1.0 + bend if sec.rubato_shape == "arch"
                             else 1.0 - bend)
@@ -2577,62 +2868,104 @@ class Song:
                 if any(a <= pos < b for a, b in spans):
                     bpm /= self.fermata
                 bpm_now = bpm
-                events.append((cursor + pos, "tempo", 0, bpm, 0))
+                events.append((cursor + pos, "tempo", 0, bpm, 0, None))
             cursor += end
         drop = _settle(strikes)
-        events = [tuple(e) for e in events if id(e) not in drop]
-        events.sort(key=lambda e: (e[0], e[1] != "off"))
-        return events, cursor
+        kept = [e for e in events if id(e) not in drop]
+        kept.sort(key=lambda e: (e[0], e[1] != "off"))
+        return [tuple(e[:5]) for e in kept], cursor, [e[5] for e in kept]
 
-    def _midifile(self, order: list[str] | None = None) -> "mido.MidiFile":
-        events, total = self._events(order)
-        mid = mido.MidiFile(type=0, ticks_per_beat=TPB)
-        tr = mido.MidiTrack()
-        mid.tracks.append(tr)
-        tr.append(mido.MetaMessage("set_tempo",
-                                   tempo=mido.bpm2tempo(self.tempo)))
+    def _midifile(self, order: list[str] | None = None,
+                  tracks: bool = True) -> "mido.MidiFile":
+        """The song as a Standard MIDI File. With `tracks`, type 1: a
+        conductor track (title, composer, tempo map, time and key
+        signatures, a marker at each section) and one named track per
+        voice role, each holding its notes and its channel's program
+        changes, the pedals of a channel riding on the first track that
+        plays it; without, type 0, everything in one track."""
+        events, total, roles = self._events_full(order)
+        seq = order or self.order or list(self.sections)
+        role_order = []
+        for name in seq:
+            for v in self.sections[name].voices:
+                role = v.name.split(".", 1)[1]
+                if role not in role_order:
+                    role_order.append(role)
+        home = {}                      # channel -> the role that carries it
+        for name in seq:
+            for v in self.sections[name].voices:
+                home.setdefault(v.channel, v.name.split(".", 1)[1])
+        lanes = {None: []}             # role (None: conductor) -> events
+        for role in role_order:
+            lanes[role] = []
+        # (tick, rank, message): metas first at a tick, then programs,
+        # then the rendered stream in its own order
+        conductor = lanes[None]
+        conductor.append((0, 0, mido.MetaMessage(
+            "set_tempo", tempo=mido.bpm2tempo(self.tempo))))
         if self.title:
-            tr.append(mido.MetaMessage("track_name", name=self.title))
+            conductor.append((0, 0, mido.MetaMessage("track_name",
+                                                     name=self.title)))
         if self.composer:
-            tr.append(mido.MetaMessage("text",
-                                       text=f"composer: {self.composer}"))
-        # Each channel's program where a section starts using it or
-        # changes it, so a channel can change instrument between sections.
-        changes, current, cursor = [], {}, 0
-        for name in order or self.order or list(self.sections):
+            conductor.append((0, 0, mido.MetaMessage(
+                "text", text=f"composer: {self.composer}")))
+        current, cursor = {}, 0
+        for name in seq:
             sec = self.sections[name]
+            ln = sec.length_beats()
+            conductor.append((cursor, 0, mido.MetaMessage("marker",
+                                                          text=name)))
+            conductor.append((cursor, 0, mido.MetaMessage(
+                "key_signature", key=sec.key or self.key)))
+            prev = None
+            for start, _beats, _number, sig in sec.bar_grid(ln):
+                if sig != prev:
+                    num, den = sig.split("/")
+                    conductor.append((cursor + round(start * TPB), 0,
+                                      mido.MetaMessage(
+                                          "time_signature",
+                                          numerator=int(num),
+                                          denominator=int(den))))
+                    prev = sig
+            # each channel's program where a section starts using it or
+            # changes it, so a channel can change instrument by section
             for v in sec.voices:
                 if current.get(v.channel) != v.program:
                     current[v.channel] = v.program
-                    changes.append((cursor, v.channel, v.program))
-            cursor += round(sec.length_beats() * TPB)
-        last = 0
-        pending = iter(changes)
-        change = next(pending, None)
-        for tick, kind, ch, a, b in events:
-            while change is not None and change[0] <= tick:
-                tr.append(mido.Message("program_change", channel=change[1],
-                                       program=change[2],
-                                       time=change[0] - last))
-                last = change[0]
-                change = next(pending, None)
-            dt = tick - last
-            last = tick
+                    lanes[v.name.split(".", 1)[1]].append(
+                        (cursor, 1, mido.Message("program_change",
+                                                 channel=v.channel,
+                                                 program=v.program)))
+            cursor += round(ln * TPB)
+        for rank, ((tick, kind, ch, a, b), role) in enumerate(
+                zip(events, roles), start=2):
             if kind == "on":
-                tr.append(mido.Message("note_on", channel=ch, note=a,
-                                       velocity=b, time=dt))
+                msg = mido.Message("note_on", channel=ch, note=a, velocity=b)
             elif kind == "off":
-                tr.append(mido.Message("note_off", channel=ch, note=a,
-                                       velocity=0, time=dt))
+                msg = mido.Message("note_off", channel=ch, note=a, velocity=0)
             elif kind in ("cc64", "cc67"):
-                tr.append(mido.Message("control_change", channel=ch,
-                                       control=int(kind[2:]), value=a,
-                                       time=dt))
-            elif kind == "tempo":
-                tr.append(mido.MetaMessage(
-                    "set_tempo", tempo=mido.bpm2tempo(a), time=dt))
-        tr.append(mido.MetaMessage("end_of_track",
-                                   time=max(0, total - last)))
+                msg = mido.Message("control_change", channel=ch,
+                                   control=int(kind[2:]), value=a)
+                role = home.get(ch)
+            else:
+                msg = mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(a))
+                role = None
+            lanes[role].append((tick, rank, msg))
+        mid = mido.MidiFile(type=1 if tracks else 0, ticks_per_beat=TPB)
+        groups = ([lanes[None]] + [lanes[r] for r in role_order] if tracks
+                  else [[e for lane in lanes.values() for e in lane]])
+        for index, lane in enumerate(groups):
+            tr = mido.MidiTrack()
+            if tracks and index:
+                tr.append(mido.MetaMessage("track_name",
+                                           name=role_order[index - 1]))
+            last = 0
+            for tick, _rank, msg in sorted(lane, key=lambda e: e[:2]):
+                tr.append(msg.copy(time=tick - last))
+                last = tick
+            tr.append(mido.MetaMessage("end_of_track",
+                                       time=max(0, total - last)))
+            mid.tracks.append(tr)
         return mid
 
     def events(self, order: list[str] | None = None) -> list:
@@ -2661,9 +2994,13 @@ class Song:
                                       velocity=0)))
         return taps
 
-    def save(self, path: str, only: str | None = None) -> str:
-        """Write the song to a standard MIDI file and return the path."""
-        self._midifile([only] if only else None).save(path)
+    def save(self, path: str, only: str | None = None,
+             tracks: bool = True) -> str:
+        """Write the song to a Standard MIDI File and return the path: a
+        type 1 file with a conductor track and a track per voice role,
+        which a DAW opens as separate parts, or with tracks=False a
+        single-track type 0 file."""
+        self._midifile([only] if only else None, tracks).save(path)
         return path
 
     def play(self, port: str | None = None, only: str | None = None,
@@ -2978,7 +3315,7 @@ class Song:
                     **v.pitch_metrics(),
                 })
             out["sections"].append({
-                "name": name, "bars": ln / sec.bpb, "key": sec.key,
+                "name": name, "bars": sec.bar_count(ln), "key": sec.key,
                 "pedal": sec.pedal_mode, "soft": sec.soft_pedal,
                 "rubato": sec.rubato_depth, "voices": voices,
             })
@@ -3007,7 +3344,6 @@ class Song:
             sec = self.sections[name]
             length = sec.length_beats()
             anac = sec._anacrusis()
-            win = {"beat": 1.0, "half": sec.bpb / 2, "bar": sec.bpb}[per]
             sounding = []
             for v in sec.voices:
                 if v.drums:
@@ -3019,10 +3355,16 @@ class Song:
                     sounding += [(t, t + n.beats, p) for p in n.pitches]
                     t += n.beats
             edges = {0.0, length}
-            k = 0
-            while anac + k * win < length - 1e-9:
-                edges.add(round(anac + k * win, 9))
-                k += 1
+            if per == "beat":
+                k = 0
+                while anac + k < length - 1e-9:
+                    edges.add(round(anac + k, 9))
+                    k += 1
+            else:
+                for start, beats, number, _time in sec.bar_grid(length):
+                    edges.add(round(start, 9))
+                    if per == "half" and number >= 1:
+                        edges.add(round(start + beats / 2, 9))
             edges = sorted(edges)
             flat = KEYS.get(_resolve_key(sec.key or self.key), (0, "#"))[1] == "b"
             for a, b in zip(edges, edges[1:]):
@@ -3044,17 +3386,17 @@ class Song:
     def to_lilypond(self, path: str | None = None) -> str:
         """Engrave the song as LilyPond source: a text score that both
         diffs and typesets. One staff per voice role, concatenated in
-        arrangement order, carrying key, time, tempo, pickups, notes,
-        chords, rests, ties, dots, tuplets of any size, grace notes, and
-        staccato, fermata, and arpeggio marks; a drum voice engraves on
-        a drum staff. Returns the source and writes it to `path` when
-        given; run it through `lilypond file.ly` for a PDF. A note whose
-        length has no written form, which only the raw Note API can
-        produce, raises. MusicXML is left to the DAWs — a library whose
-        claim is that the score is symbolic all the way down exports the
-        format that stays text."""
+        arrangement order, carrying key, time and its changes, tempo,
+        pickups, notes, chords, rests, ties, dots, tuplets of any size
+        and nesting, grace notes, and staccato, fermata, and arpeggio
+        marks; a note that crosses a barline is split there and tied,
+        and a drum voice engraves on a drum staff. Returns the source
+        and writes it to `path` when given; run it through
+        `lilypond file.ly` for a PDF. A note whose length has no written
+        form, which only the raw Note API can produce, raises."""
         from fractions import Fraction
         order = self.order or list(self.sections)
+        plain = {Fraction(4) / 2 ** k for k in range(8)}   # whole .. 128th
         roles, drum_roles = [], set()
         for name in order:
             for v in self.sections[name].voices:
@@ -3151,22 +3493,35 @@ class Song:
                 attack += "\\arpeggio"
             return attack, ("\\fermata" if n.hold else "")
 
+        def bar_start(grid, bar):
+            """The beat where bar number `bar` begins, continuing past the
+            section's end in its last meter."""
+            full = [g for g in grid if g[2] >= 1]
+            for start, _beats, number, _time in full:
+                if number == bar:
+                    return start
+            if not full:
+                return 0.0
+            start, beats, number, _time = full[-1]
+            return start + (bar - number) * beats
+
         def cues(sec_name, sec):
             """Beat -> tempo mark for the section: a step change as a
             metronome mark, a ramp as rit. or accel., both in one mark
             where they start together."""
-            anac = sec._anacrusis()
-            bpm_at, _has_plan = self._base_bpm_fn(sec_name, sec,
-                                                  round(anac * TPB))
+            length = sec.length_beats()
+            grid = sec.bar_grid(length)
+            bpm_at, _has_plan = self._base_bpm_fn(
+                sec_name, sec._bar_position(length))
             marks_at = {}
             for (sn, bar), bpm in self._tempo_changes.items():
                 if sn == sec_name:
-                    b = anac + (bar - 1) * sec.bpb
+                    b = bar_start(grid, bar)
                     marks_at.setdefault(b, ["", ""])[1] = (
                         f"4 = {int(round(bpm))}")
             for sn, f, t, bpm in self._ramps:
                 if sn == sec_name:
-                    b = anac + (f - 1) * sec.bpb
+                    b = bar_start(grid, f)
                     if t <= f:               # a ramp of no length is a step
                         marks_at.setdefault(b, ["", ""])[1] = (
                             f"4 = {int(round(bpm))}")
@@ -3179,16 +3534,131 @@ class Song:
             return {b: "\\tempo " + " ".join(x for x in m if x) + " "
                     for b, m in marks_at.items()}
 
-        def body(v, flat, tempo_at, last_section):
+        def meter_marks(sec, grid):
+            """Beat -> \\time command where the meter changes inside the
+            section (the section's opening meter is in its head)."""
+            marks_at, prev = {}, sec.time_sig
+            for start, _beats, number, sig in grid:
+                if number >= 1 and sig != prev:
+                    marks_at[start] = f"\\time {sig} "
+                prev = sig if number >= 1 else prev
+            return marks_at
+
+        def written(b):
+            """Written values for b beats: one value, else a tied sum of
+            values, else a counted length."""
+            d = dur_of(b)
+            if d:
+                return [d]
+            return pieces(b) or [length(b)]
+
+        def tuplet_ratio(members, span):
+            """(normal notes, written value) for a tuplet of `members`
+            filling `span` written beats: None when each member is itself
+            a written value (a duplet in 6/8 needs no bracket); else the
+            plain value the members are written as and how many of it
+            fill the span, the count nearest below the members first (3
+            in the time of 2, 5 of 4, 7 of 4, 9 of 8)."""
+            if dur_of(span / members):
+                return None
+            for m in (list(range(members - 1, 0, -1))
+                      + list(range(members + 1, 4 * members + 1))):
+                if span / m in plain:
+                    return m, span / m
+            for m in range(1, 4 * members + 1):
+                if dur_of(span / m):
+                    return m, span / m
+            raise CompositionError(
+                f"to_lilypond: {members} tuplet members in {float(span):g} "
+                f"beats have no written form")
+
+        def body(v, flat, tempo_at, meters_at, bars, last_section):
             out, grace, notes, i, pos = [], [], v.notes, 0, 0.0
             pedal = sorted(v.pedal_marks)
             down = False
             tempo_at = dict(tempo_at)
+            meters_at = dict(meters_at)
 
             def before(at):
-                """Tempo marks due at beat `at`, emitted ahead of a note."""
+                """Tempo and meter marks due at beat `at`, emitted ahead of
+                a note."""
+                s = "".join(meters_at.pop(b) for b in
+                            sorted(b for b in meters_at if b <= at + 1e-9))
                 due = sorted(b for b in tempo_at if b <= at + 1e-9)
-                return "".join(tempo_at.pop(b) for b in due)
+                return s + "".join(tempo_at.pop(b) for b in due)
+
+            def segments(at, beats):
+                """[at, at + beats) cut at the barlines inside it, as
+                (start, length) pieces."""
+                cuts = [b for b in bars if at + 1e-9 < b < at + beats - 1e-9]
+                out_, s = [], at
+                for c in cuts + [at + beats]:
+                    out_.append((s, c - s))
+                    s = c
+                return out_
+
+            def held(text, at, beats, first, last, tie_out):
+                """A sounding note or chord of `beats` beats at `at`,
+                split at barlines and tied across them: `first` rides on
+                its first written value, `last` on its last."""
+                vals = []
+                for s, ln in segments(at, beats):
+                    for k, x in enumerate(written(ln)):
+                        vals.append((before(s) if k == 0 else "", x))
+                return " ".join(
+                    lead + text + x + (first if k == 0 else "")
+                    + (last if k == len(vals) - 1 else "")
+                    + ("~" if k < len(vals) - 1 or tie_out else "")
+                    for k, (lead, x) in enumerate(vals))
+
+            def silent(at, beats, first):
+                """A rest, split at barlines."""
+                vals = []
+                for s, ln in segments(at, beats):
+                    for k, x in enumerate(written(ln)):
+                        vals.append((before(s) if k == 0 else "", x))
+                return " ".join(lead + "r" + x + (first if k == 0 else "")
+                                for k, (lead, x) in enumerate(vals))
+
+            def group(idxs, level, scale):
+                """The tuplet at `level` of the notes idxs (consecutive
+                members of one group): its members written at the scale
+                of the enclosing tuplets, nested groups within."""
+                nonlocal pos
+                _gid, members, span = notes[idxs[0]].tup[level]
+                span_w = Fraction(span).limit_denominator(4096) / scale
+                ratio = tuplet_ratio(members, span_w)
+                inner = scale if ratio is None else scale * Fraction(
+                    ratio[0], members)
+                parts, k = [], 0
+                while k < len(idxs):
+                    j = idxs[k]
+                    g = notes[j]
+                    if len(g.tup) > level + 1:
+                        sub_id = g.tup[level + 1][0]
+                        sub = [x for x in idxs[k:] if len(notes[x].tup)
+                               > level + 1 and notes[x].tup[level + 1][0]
+                               == sub_id]
+                        parts.append(group(sub, level + 1, inner))
+                        k += len(sub)
+                        continue
+                    wd = dur_of(Fraction(g.beats).limit_denominator(4096)
+                                / inner)
+                    if wd is None:
+                        raise CompositionError(
+                            f"to_lilypond: a tuplet member of {g.beats:g} "
+                            f"beats has no written form")
+                    lead = before(pos)
+                    parts.append(
+                        lead + (("r" + wd) if not g.pitches
+                                else note_str(g, flat, v.drums) + wd)
+                        + after(j, pos) + ("~" if g.tie else ""))
+                    pos += g.beats
+                    k += 1
+                if ratio is None:
+                    return " ".join(parts)
+                return (f"\\tuplet {members}/{ratio[0]} {{ "
+                        + " ".join(parts) + " }")
 
             def after(j, at):
                 """Dynamics, hairpins, and pedal marks for note j at beat
@@ -3226,25 +3696,29 @@ class Song:
                             break
                         j += 1
                     last_note = notes[min(j, len(notes) - 1)]
-                    vals = [dur_of(total)] if dur_of(total) else pieces(total)
-                    if vals is None:
-                        vals = [length(total)]
-                    s = pitch_names(n, flat)[0]
-                    lead = before(pos)
-                    out.append(lead + " ".join(
-                        s + x + (after(i, pos) + "\\trill" if k == 0 else "")
-                        + ("~" if k < len(vals) - 1 or last_note.tie else "")
-                        for k, x in enumerate(vals)))
+                    out.append(held(pitch_names(n, flat)[0], pos, total,
+                                    after(i, pos) + "\\trill", "",
+                                    last_note.tie))
                     pos += total
                     i = j + 1
                     continue
+                if n.tup:                           # a written tuplet
+                    gid = n.tup[0][0]
+                    idxs = []
+                    while (i < len(notes) and notes[i].tup
+                           and notes[i].tup[0][0] == gid):
+                        idxs.append(i)
+                        i += 1
+                    out.append(group(idxs, 0, Fraction(1)))
+                    continue
                 d = dur_of(n.beats)
-                vals = [d] if d else pieces(n.beats)
-                if vals is None:                    # a tuplet run
-                    b = n.beats
-                    size, wd, den = tuplet(b)
+                if not d and pieces(n.beats) is None and not any(
+                        pos + 1e-9 < b < pos + n.beats - 1e-9 for b in bars):
+                    b = n.beats                     # a figure of equal
+                    size, wd, den = tuplet(b)       # tuplet-length notes
                     grp = []
                     while (i < len(notes) and not notes[i].grace
+                           and not notes[i].tup
                            and abs(notes[i].beats - b) < 1e-9):
                         grp.append((i, notes[i]))
                         i += 1
@@ -3260,20 +3734,12 @@ class Song:
                         out.append(f"\\tuplet {size}/{den} {{ "
                                    + " ".join(inner) + " }")
                     continue
-                lead = before(pos)
                 if not n.pitches:
-                    out.append(lead + " ".join(
-                        "r" + x + (after(i, pos) if k == 0 else "")
-                        for k, x in enumerate(vals)))
+                    out.append(silent(pos, n.beats, after(i, pos)))
                 else:
-                    s = note_str(n, flat, v.drums)
                     attack, release = ("", "") if v.drums else marks(n)
-                    last = len(vals) - 1
-                    out.append(lead + " ".join(
-                        s + x + (attack + after(i, pos) if k == 0 else "")
-                        + (release if k == last else "")
-                        + ("~" if k < last or n.tie else "")
-                        for k, x in enumerate(vals)))
+                    out.append(held(note_str(n, flat, v.drums), pos, n.beats,
+                                    attack + after(i, pos), release, n.tie))
                 pos += n.beats
                 i += 1
             if down and not last_section:   # lift where the section ends; the
@@ -3290,18 +3756,30 @@ class Song:
                 flat = KEYS.get(_resolve_key(kn), (0, "#"))[1] == "b"
                 v = next((x for x in sec.voices
                           if x.name.split(".", 1)[1] == role), None)
-                anac = sec._anacrusis()
+                sec_len = sec.length_beats()
+                grid = sec.bar_grid(sec_len)
+                anac = sec._anacrusis_of(sec_len)
+                meters_at = meter_marks(sec, grid)
                 seg = head(kn, sec.time_sig, drums)
                 if anac:
                     seg += f"\\partial {length(anac)} "
                 if v is None:
-                    nbars = int(round((sec.length_beats() - anac) / sec.bpb))
-                    bar = length(sec.bpb)
                     rests = [f"R{length(anac)}"] if anac else []
-                    if nbars and "*" not in bar:
-                        rests.append(f"R{bar}*{nbars}")
-                    else:
-                        rests += [f"R{bar}"] * nbars
+                    run, count = None, 0
+                    for start, beats, number, _time in grid:
+                        if number < 1:
+                            continue
+                        mark = meters_at.get(start, "")
+                        if run is not None and (mark or beats != run[1]):
+                            rests.append(run[0] + f"R{length(run[1])}"
+                                         + (f"*{count}" if count > 1 else ""))
+                            run, count = None, 0
+                        if run is None:
+                            run = (mark, beats)
+                        count += 1
+                    if run is not None:
+                        rests.append(run[0] + f"R{length(run[1])}"
+                                     + (f"*{count}" if count > 1 else ""))
                     seg += " ".join(rests)
                 else:
                     # tempo marks ride on the first role present here
@@ -3310,6 +3788,7 @@ class Song:
                                           for x in sec.voices))
                     seg += body(v, flat,
                                 cues(name, sec) if role == carrier else {},
+                                meters_at, [g[0] for g in grid if g[0] > 0],
                                 name is order[-1])
                 parts.append(seg)
             kind, mode = ("DrumStaff", "\\drummode ") if drums else ("Staff", "")
@@ -3368,6 +3847,9 @@ class Song:
                 extras.append(f"key={sec.key}")
             if sec.bpb != self.beats_per_bar:
                 extras.append(f"{sec.bpb}-beat bars")
+            if sec.meters:
+                extras.append("meters " + ", ".join(
+                    f"{t} at bar {b}" for b, t in sorted(sec.meters.items())))
             if sec.pedal_mode:
                 extras.append(f"pedal={sec.pedal_mode}")
             if sec.soft_pedal:
@@ -3379,7 +3861,7 @@ class Song:
             chans = {v.channel for v in sec.voices}
             if chans != {0}:
                 extras.append(f"channels={sorted(chans)}")
-            print(f"  [{name}] {ln / sec.bpb:.1f} bars, "
+            print(f"  [{name}] {sec.bar_count(ln):.1f} bars, "
                   f"{len(sec.voices)} voices"
                   + (f" ({', '.join(extras)})" if extras else ""))
         print(f"  total ~ {self._duration_s():.0f}s")

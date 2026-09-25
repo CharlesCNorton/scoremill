@@ -1254,7 +1254,7 @@ def test_program_changes_per_section():
     s.arrange("A B")
     progs = []
     t = 0
-    for msg in s._midifile().tracks[0]:
+    for msg in jukebox.mido.merge_tracks(s._midifile().tracks):
         t += msg.time
         if msg.type == "program_change":
             progs.append((t, msg.program))
