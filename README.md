@@ -57,7 +57,9 @@ pip install scoremill[play]     # + python-rtmidi for real-time ports
 ```
 
 Or copy `scoremill.py` into your project — it is a single file — or
-`pip install -e .` from a clone.
+`pip install -e .` from a clone. The package installs three modules:
+`scoremill`, the library; `jukebox`, the player (`python -m jukebox`);
+and `mcp_server`, the MCP server (`python -m mcp_server`).
 
 ## Sixty seconds
 
@@ -96,16 +98,17 @@ voice 'A.rh' bar 2: has 3.0 beats, expected 4.0 — short by 1.0 beats (a 'q').
 | Element | Syntax | Notes |
 |---|---|---|
 | Pitch | `c d e f g a b` + `# b n` + octave | octave is sticky per voice; key signature applies (`key="F"` makes `b` mean B-flat, `bn` natural); minor keys (`Am`, `Dm`, ...) supported |
-| Duration | trailing `w h q e s t`, up to two dots (`q.`, `q..`) | sticky; `r` = rest |
+| Duration | trailing `w h q e s t x` (whole to sixty-fourth), up to two dots (`q.`, `q..`) | sticky; `r` = rest |
 | Repeat | `c4e*4`, `(c4e d4e)*3`, `(c4w \|)*8` | writes a token or a group out N times; a group may hold barlines |
 | Chord | `[c4 e g]h` | shared duration |
-| Tuplet | `{c4 d4 e4}q`, `{[c4 e4] d4}q` | members divide the span equally; a member may be a chord |
+| Tuplet | `{c4 d4 e4}q`, `{[c4 e4] d4}q`, `{c4 {d4 e4 f4} g4}q` | members divide the span equally; a member may be a chord, or a tuplet of its own that divides the member's share |
 | Grace | `+d5` | sounds just before the next note; stackable |
 | Tie | `c5h~` | the next note must repeat the pitch (validated); a tie on a voice's last note is laissez vibrer |
 | Marks | `>` accent · `'` staccato · `_` legato · `^` fermata · `&` roll · `%` trill | after the duration; a fermata holds the moment, stretching time by `Song(fermata=)` (on a rest, `rh^`, it is a general pause); trill rate is configurable on `Song` |
 | Pedal | `ped`, `lift` | `ped` presses the sustain pedal at the next note, or changes it there; `lift` releases it; a section ends lifted |
 | Dynamics | `!ppp !pp !p !mp !mf !f !ff !fff`, `cresc`, `dim` | sticky; cresc/dim interpolate to the next mark, which must exist (validated), and keep accents |
 | Barline | `\|` | asserts the bar is exactly full; `Song(pickup=N)` allows a short first bar, and bars then count from the first downbeat |
+| Meter | `M:3/4` | opens a bar and sets the meter from there on for every voice of the section; `section.time_change(9, "3/4")` declares the same change, and a section may take its own `time=`; bar checks, bar numbers, pedaling, `harmony(slots="bar")`, and the engraving follow the meters |
 | Onset | `c5e@3` | after `voice.absolute_onsets()`, starts the note at beat 3 of the voice; a gap fills with a rest, the marks and graces written before the note stay with it, and an onset that earlier material already passed is an error |
 | Drums | `bde hh sn hh`, `[bd hh]q` | in a `section.drums()` voice (General MIDI channel 10): drum names in place of pitches, with durations, stacks, and `>` accents |
 
@@ -305,13 +308,15 @@ s.to_lilypond("piece.ly")   # then: lilypond piece.ly
 
 `to_lilypond()` writes the song as LilyPond source, a text score that
 diffs as well as it typesets: one staff per voice role across the
-arrangement, with keys, meters, tempo marks, *rit.* and *accel.*,
-pickups, chords, ties, tuplets of any size, grace notes, dynamics and
-hairpins, accents, tenuto, staccato, fermatas, arpeggios, trills, and
-notated pedaling. Notes engrave as they were written, E-flat as
-E-flat and D-sharp as D-sharp, and `song.transpose()` respells them by
-the interval; notes from `harmony()` take the key's spelling. A drum
-voice engraves on a drum staff.
+arrangement, with keys, meters and their changes, tempo marks, *rit.*
+and *accel.*, pickups, chords, ties, tuplets of any size and nesting,
+grace notes, dynamics and hairpins, accents, tenuto, staccato,
+fermatas, arpeggios, trills, and notated pedaling. A note that
+crosses a barline is split there and tied. Notes engrave as they
+were written, E-flat as E-flat and D-sharp as D-sharp, and
+`song.transpose()` respells them by the interval; notes from
+`harmony()` take the key's spelling. A drum voice engraves on a drum
+staff.
 `Song(title=, composer=)` fills the header, and the MIDI file carries
 the title as its track name, which the jukebox shows.
 
@@ -364,6 +369,13 @@ fluidsynth -a pulseaudio soundfont.sf2 piece.mid
 A pitched-instrument range guard rejects notes a piano cannot play;
 widen it for synths with `Song(pitch_range=(0, 127))`.
 
+`save(path)` writes a type 1 Standard MIDI File: a conductor track
+with the title, composer, tempo map, key and time signatures, and a
+marker at each section, then one named track per voice role, so a DAW
+opens each hand or instrument as its own part. `save(path,
+tracks=False)` writes a single-track type 0 file, and `save(path,
+only="A")` renders one section.
+
 ## Examples
 
 | File | Demonstrates |
@@ -398,7 +410,9 @@ perform it on a connected MIDI output.
 `jukebox.py` plays a whole folder of scores on a MIDI output. It
 renders each script once (the "running a script writes its `.mid`"
 contract, so a script that builds several songs contributes several
-tracks) and plays the results.
+tracks) and plays the results. From a pip install it runs as
+`python -m jukebox`, pointed at a folder with `--dir` or `--library`,
+since its default folder is a clone's `examples` directory.
 
 With no flag it opens the GUI (tkinter): a searchable
 track list, play/stop/auto/loop, tempo/volume/voice, and a Local/Remote
@@ -457,8 +471,10 @@ motif transforms and query helpers. A `CompositionError` comes back as
 
 ```
 pip install "scoremill[mcp]"
-claude mcp add --scope user scoremill -- python /path/to/mcp_server.py
+claude mcp add --scope user scoremill -- python -m mcp_server
 ```
+
+From a clone, register `python /path/to/mcp_server.py` instead.
 
 ## License
 

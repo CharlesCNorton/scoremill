@@ -21,7 +21,7 @@ NOTATION REFERENCE
             Pitches outside the instrument range (default 21-108, a
             standard piano) are rejected; Song(pitch_range=(lo, hi))
             overrides.
-  Duration  trailing letter w h q e s t (whole through thirty-second),
+  Duration  trailing letter w h q e s t x (whole through sixty-fourth),
             with up to two dots (q. = 1.5 beats, q.. = 1.75). Persists
             until changed: "c4q d e f gh" is three further quarters,
             then a half. "r" denotes a rest.
@@ -29,8 +29,9 @@ NOTATION REFERENCE
             group, which may hold barlines: (c4w |)*8.
   Chord     [c4 e g]h — simultaneous pitches with a shared duration.
   Tuplet    {c4 d4 e4}q — members divide the span equally. Members may
-            be chords ({[c4 e4] d4 [c4 e4]}q) and do not carry
-            duration letters.
+            be chords ({[c4 e4] d4 [c4 e4]}q) or tuplets of their own
+            ({c4 {d4 e4 f4} g4}q), which divide their member's share,
+            and do not carry duration letters.
   Grace     +d5 — sounds approximately 60 ticks before the next note;
             multiple grace notes stack.
   Tie       trailing ~ joins the note to the next note, which must
@@ -54,6 +55,11 @@ NOTATION REFERENCE
             bar remains legal. In a section that opens with a pickup,
             bar numbers, the pedal, tempo changes, swing, and the
             downbeat lean all count from the first downbeat.
+  Meter     M:3/4 at the start of a bar changes the meter from that
+            bar on, for every voice of the section;
+            section.time_change(bar, "3/4") declares the same change.
+            Bar checks, bar numbers, pedaling by the bar,
+            harmony(slots="bar"), and the engraving follow the meters.
   Onset     c5e@3 places a note's onset at beat 3 from the voice's
             start, after voice.absolute_onsets(); a gap is filled with
             a rest (the marks and graces written before the note stay
@@ -122,6 +128,7 @@ STRUCTURE
            composer="An Agent")              # title/composer: MIDI and LilyPond
   A = s.section("A")
   J = s.section("Jig", key="Bb", time="6/8")     # per-section overrides
+  J.time_change(9, "9/8")                        # its meter from bar 9 on
   A.voice("rh", vel=52).bars("...")
   A.voice("str", program=48, channel=1)          # second timbre; a channel
                                                  # may change program by section
@@ -178,7 +185,8 @@ RECOMMENDED WORKFLOW
      reported at parse time.
   2. Review describe(), lint(), and report().
   3. Audition with play(only=<section>).
-  4. Render with save(<path>).
+  4. Render with save(<path>): a type 1 MIDI file with a conductor
+     track and a track per voice role (tracks=False: one track).
 """
 from __future__ import annotations
 
@@ -189,7 +197,7 @@ import time
 
 import mido
 
-__version__ = "0.5.0"
+__version__ = "0.8.0"
 
 TPB = 480
 PIANO_LO, PIANO_HI = 21, 108
@@ -893,6 +901,16 @@ def harmonize(frag: str, symbols: str, key: str = "C", voices: int = 3,
     in, and spells the added notes (with explicit accidentals)."""
     if voices < 2:
         raise CompositionError("harmonize: voices is 2 or more")
+    if slots != "bar":
+        try:
+            per = 0.0 if isinstance(slots, bool) else float(slots)
+        except (TypeError, ValueError):
+            per = 0.0
+        if not per > 0:
+            raise CompositionError(
+                f'harmonize: slots is "bar" or a positive number of beats '
+                f'(got {slots!r})')
+        slots = per
     syms = []
     for tok in _tokenize(symbols):
         if tok == "|":
@@ -3750,7 +3768,7 @@ class Song:
         for r_index, role in enumerate(roles):
             drums = role in drum_roles
             parts = []
-            for name in order:
+            for index, name in enumerate(order):
                 sec = self.sections[name]
                 kn = sec.key or self.key
                 flat = KEYS.get(_resolve_key(kn), (0, "#"))[1] == "b"
@@ -3789,7 +3807,7 @@ class Song:
                     seg += body(v, flat,
                                 cues(name, sec) if role == carrier else {},
                                 meters_at, [g[0] for g in grid if g[0] > 0],
-                                name is order[-1])
+                                index == len(order) - 1)
                 parts.append(seg)
             kind, mode = ("DrumStaff", "\\drummode ") if drums else ("Staff", "")
             # a staff that lives below middle C reads in the bass clef
@@ -3901,14 +3919,16 @@ offending bar. Below the notation, song.events() is the raw stream.
 
 CHEATSHEET = '''
 PITCH  c..b [+ # b n] [+octave]   sticky octave; key sig applies
-DUR    w h q e s t [+ . or ..]    sticky;  r = rest (re = eighth rest)
+DUR    w h q e s t x [+ . or ..]  sticky;  r = rest (re = eighth rest)
 REPEAT c4e*4   (c4e d4e)*3   (c4w |)*8      tokens or groups, barlines allowed
 CHORD  [c4 e g]h   TUPLET {c d e}q or {[c4 e4] d4}q   GRACE +d5   TIE c5h~
+        tuplets nest: {c4 {d4 e4 f4} g4}q
 MARKS  > accent  ' stacc  _ legato  ^ fermata (holds time; rh^ = pause)
         & roll  % trill
 PEDAL  ped (press, or change at the next note)   lift (release)
 DYN    !ppp !pp !p !mp !mf !f !ff !fff   cresc/dim toward next !dyn
 BAR    | must be exactly full (pickup= allows short OR full first bar)
+METER  M:3/4 opens a bar: the meter from there on, for the whole section
 LV     a tie on a voice's final note lets it ring (laissez vibrer)
 ONSET  c5e@3  absolute onset at beat 3 (voice.absolute_onsets() to opt in;
         fills a gap with a rest, errors if earlier material drifted past it)
@@ -3931,8 +3951,8 @@ SONG   Song(tempo,time,key,pickup,humanize,swing,swing_unit,
        .section(name,key=,time=) .arrange("A A B A") .events()
        .tempo_change(sec,bar,bpm) .ritardando(sec,from,to,bpm)
        .describe() .lint(mode=full|homophonic|strict, only=) .report()
-       .chords(per=)
-       .to_lilypond() .play(port=,only=,count_in=,progress=) .save(path)
+       .chords(per=) .save(path, tracks=)   type 1: a track per voice role
+       .to_lilypond() .play(port=,only=,count_in=,progress=)
 REPORT per-voice pitch metrics: pitch_classes, out_of_key_rate, intervals,
        self_similarity, grace.  strict lint adds crossings, unresolved
        leading tones, unprepared dissonances, tessitura, wide chords.
@@ -3940,7 +3960,7 @@ CHORDS song.chords(per="beat"|"half"|"bar") names what sounds: check the
        progression you meant against the one you wrote.
 SECTION .voice(name,vel,octave,program,channel,absolute=) .drums(name,vel)
         .pedal("bar"|"half"|N) .soft() .rubato(...) .swing(amount, unit)
-        .variant(name, vel_scale)
+        .time_change(bar, "3/4") .variant(name, vel_scale)
 '''
 
 

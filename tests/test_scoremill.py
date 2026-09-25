@@ -1159,6 +1159,18 @@ def test_harmonize_passes_marks_and_keeps_ties():
         assert "chord symbols" in str(e)
 
 
+def test_harmonize_rejects_bad_slots():
+    for bad in ("half", 0, -2):
+        try:
+            harmonize("c5q d5q e5q f5q |", "C", slots=bad)
+            raise AssertionError("slots check did not fire")
+        except CompositionError as e:
+            assert "slots" in str(e)
+    # a number written as a string, as the MCP tool passes it
+    assert harmonize("c5q d5 e5 f5 |", "C G7", slots="2") == \
+        harmonize("c5q d5 e5 f5 |", "C G7", slots=2)
+
+
 def test_note_pitch_and_name():
     assert note_pitch("c#5") == 73
     assert note_pitch("b4", key="F") == 70             # the signature applies
@@ -1324,6 +1336,17 @@ def test_lilypond_piano_staff_and_bass_clef():
     assert ly.count("\\clef bass") == 1            # the left hand only
 
 
+def test_lilypond_lifts_pedal_at_each_repeat_but_the_last():
+    # a section that ends pedaled engraves its lift wherever it recurs
+    # before the end, whatever the length of its name
+    for a, b in (("A", "B"), ("Aa", "Bb")):
+        s = Song()
+        s.section(a).voice("m").bars("ped c4w |")
+        s.section(b).voice("m").bars("e4w |")
+        s.arrange(f"{a} {b} {a}")
+        assert s.to_lilypond().count("s1*0\\sustainOff") == 1, a
+
+
 def test_section_swing_overrides_the_song():
     s = Song(swing=0.5, expressive=False, humanize=0)
     s.section("STRAIGHT").voice("m").bars("c4e d4e e4e f4e g4h |")
@@ -1344,6 +1367,63 @@ def test_song_dynamics_retune_the_levels():
         raise AssertionError("dynamics check did not fire")
     except CompositionError as e:
         assert "dynamics" in str(e)
+
+
+def test_meter_changes_within_a_section():
+    s = Song(time="4/4")
+    sec = s.section("A")
+    sec.time_change(2, "3/4")
+    sec.voice("rh").bars("c5w | d5h. | M:2/4 e5h | f5h |")
+    lh = sec.voice("lh")
+    lh.harmony("C G C F", octave=3)               # one chord per bar
+    s.arrange("A")
+    assert [n.beats for n in lh.notes] == [4.0, 3.0, 2.0, 2.0]
+    assert sec.locate(9.0) == "bar 4 beat 1"
+    sigs = [(m.numerator, m.denominator) for m in s._midifile().tracks[0]
+            if m.type == "time_signature"]
+    assert sigs == [(4, 4), (3, 4), (2, 4)]
+    ly = s.to_lilypond()
+    assert "\\time 3/4" in ly and "\\time 2/4" in ly
+    for bad, word in (("c5w | M:3/4 d5w |", "over by"),
+                      ("c5h M:3/4 d5h |", "must open a bar")):
+        try:
+            Song().section("B").voice("m").bars(bad)
+            raise AssertionError("meter check did not fire")
+        except CompositionError as e:
+            assert word in str(e), e
+    fixed = Song().section("C")
+    fixed.time_change(2, "3/4")
+    try:
+        fixed.voice("m").bars("c5w | M:2/4 d5h |")
+        raise AssertionError("meter contradiction check did not fire")
+    except CompositionError as e:
+        assert "already changes" in str(e)
+
+
+def test_nested_tuplets_and_sixty_fourths():
+    s = Song()
+    v = s.section("N").voice("m")
+    v.bars("{c4 {d4 e4 f4} g4}q c4x*16 c4h |")
+    s.arrange("N")
+    assert [round(n.beats, 6) for n in v.notes[:5]] == \
+        [round(x, 6) for x in (1 / 3, 1 / 9, 1 / 9, 1 / 9, 1 / 3)]
+    assert v.notes[5].beats == 0.0625 and abs(v.total_beats() - 4) < 1e-9
+    ly = s.to_lilypond()
+    assert "\\tuplet 3/2 { c'8 \\tuplet 3/2 { d'16 e'16 f'16 } g'8 }" in ly
+    assert "c'64" in ly
+
+
+def test_save_writes_a_track_per_voice_role():
+    s = Song(title="Two Hands")
+    a = s.section("A")
+    a.voice("rh").bars("c5w |")
+    a.voice("lh").bars("c3w |")
+    s.arrange("A")
+    multi, single = s._midifile(), s._midifile(tracks=False)
+    assert multi.type == 1
+    assert [t.name for t in multi.tracks] == ["Two Hands", "rh", "lh"]
+    assert all(any(m.type == "note_on" for m in t) for t in multi.tracks[1:])
+    assert single.type == 0 and len(single.tracks) == 1
 
 
 def test_random_songs_through_every_path():

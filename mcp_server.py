@@ -23,6 +23,7 @@ SONG SPEC (the shape every build tool takes)
       "dynamics": {"p": 45},
       "sections": [
         {"name": "A", "key": "Am", "time": "6/8",
+         "time_changes": [{"bar": 9, "time": "9/8"}],
          "pedal": "bar", "soft": false,
          "rubato": {"depth": 0.05, "phrase": 2, "shape": "arch"},
          "swing": {"amount": 0.62, "unit": "eighth"},
@@ -49,7 +50,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mcp.server.fastmcp import FastMCP
+try:                                   # mcp 2
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:                    # mcp 1
+    from mcp.server.fastmcp import FastMCP
 
 import scoremill
 from scoremill import (CompositionError, Song, chord_pitches, double,
@@ -73,6 +77,8 @@ def build_song(spec: dict) -> Song:
              dynamics=spec.get("dynamics"))
     for sd in spec.get("sections", []):
         sec = s.section(sd["name"], key=sd.get("key"), time=sd.get("time"))
+        for tc in sd.get("time_changes", []):
+            sec.time_change(tc["bar"], tc["time"])
         for vd in sd.get("voices", []):
             if vd.get("drums"):
                 v = sec.drums(vd.get("name", "kit"), vel=vd.get("vel", 70))
@@ -223,11 +229,8 @@ def harmonize_melody(fragment: str, symbols: str, key: str = "C",
     bar, or per `slots` beats given as a number), string to string, with
     the added notes chosen so that no voices, and none against the
     optional `bass` fragment, move in consecutive fifths or octaves."""
-    def go():
-        per = slots if slots in ("bar",) else float(slots)
-        return {"result": harmonize(fragment, symbols, key, voices,
-                                    bass=bass or None, slots=per)}
-    return _guard(go)
+    return _guard(lambda: {"result": harmonize(
+        fragment, symbols, key, voices, bass=bass or None, slots=slots)})
 
 
 @mcp.tool()
