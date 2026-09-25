@@ -2,9 +2,10 @@
 """scoremill MCP server.
 
 Exposes scoremill to an MCP client (Claude Desktop, Claude Code, ...):
-build a song from a JSON spec and get its MIDI, report, lint, chord
-analysis, or engraved LilyPond, plus the motif transforms and the
-chord/scale query helpers.
+build a song from a JSON spec and get its MIDI, report, lint, rubs,
+motif statements, chord analysis, or engraved LilyPond; read an
+existing MIDI file for the same analysis; plus the motif transforms
+and the chord/scale query helpers.
 
 Register with Claude Code:
 
@@ -148,6 +149,55 @@ def lint(spec: dict, mode: str = "full", only: str = "") -> dict:
     `only` names one section to check alone."""
     return _guard(lambda: {"findings": build_song(spec).lint(
         quiet=True, mode=mode, only=only or None)})
+
+
+@mcp.tool()
+def rubs(spec: dict, only: str = "", min_beats: float = 0.5) -> dict:
+    """Build the song and return the notes of two voices a minor second,
+    major seventh, or minor ninth apart that ring together for at least
+    `min_beats`, following the pedaling (a note held by the pedal rings
+    until the pedal changes). `only` names one section."""
+    return _guard(lambda: {"findings": build_song(spec).rubs(
+        quiet=True, only=only or None, min_beats=min_beats)})
+
+
+@mcp.tool()
+def find_motif(spec: dict, fragment: str, key: str = "",
+               only: str = "") -> dict:
+    """Build the song and list every place the notation `fragment`
+    sounds with its rhythm and intervals intact, at any exact
+    transposition: {section, voice, at, semitones}. `key` reads the
+    fragment (the song's key by default); `only` names one section."""
+    return _guard(lambda: {"matches": build_song(spec).find(
+        fragment, key=key or None, only=only or None)})
+
+
+@mcp.tool()
+def analyze_midi(path: str, per: str = "bar", grid: int = 12,
+                 motif: str = "", key: str = "") -> dict:
+    """Read the Standard MIDI File at `path` and return its report (with
+    lint findings and rubs) and the chords that sound per beat, half
+    bar, or bar (`per`). Onsets snap to 1/`grid` of a beat, 0 keeping
+    every tick. With `motif`, a notation fragment read in `key`, also
+    list where it sounds."""
+    def go():
+        try:
+            s = Song.from_midi(path, grid=grid or None)
+        except (OSError, EOFError, ValueError) as e:
+            return {"error": f"cannot read {path}: {e}"}
+        out = {"report": s.report(), "chords": s.chords(per=per)}
+        if motif:
+            out["matches"] = s.find(motif, key=key or None)
+        return out
+    return _guard(go)
+
+
+@mcp.tool()
+def same_shape(a: str, b: str, key: str = "C") -> dict:
+    """Whether two notation fragments carry the same rhythm and the same
+    intervals, one an exact chromatic transposition of the other: the
+    check that a motif was moved without being altered."""
+    return _guard(lambda: {"same": scoremill.same_shape(a, b, key)})
 
 
 @mcp.tool()

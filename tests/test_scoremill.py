@@ -5,8 +5,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import jukebox
-from scoremill import (CompositionError, Song, chord_pitches, double,
-                       harmonize, invert, note_name, note_pitch, rebar, retro,
+from scoremill import (CompositionError, Song, chord_pitches,
+                       chord_tone_below, double, harmonize, invert, map_notes,
+                       note_name, note_pitch, rebar, retro, same_shape,
                        scale_pitches, shift, stretch, transpose,
                        transpose_chords)
 
@@ -1424,6 +1425,172 @@ def test_save_writes_a_track_per_voice_role():
     assert [t.name for t in multi.tracks] == ["Two Hands", "rh", "lh"]
     assert all(any(m.type == "note_on" for m in t) for t in multi.tracks[1:])
     assert single.type == 0 and len(single.tracks) == 1
+
+
+def test_pattern_steps_carry_their_lengths():
+    v = Song(key="Am").section("H").voice("lh")
+    v.harmony("Am E7", octave=2, pattern="0:e. 2:s 3+4:e 3+4:e")
+    assert [n.beats for n in v.notes] == [0.75, 0.25, 0.5, 0.5] * 4
+    assert v.notes[0].pitches == [45] and len(v.notes[2].pitches) == 2
+    mixed = Song(time="3/4").section("M").voice("x")
+    mixed.harmony("C C", pattern="0:q 2 4 r:q", unit=0.5)   # q e e q a bar
+    assert [n.beats for n in mixed.notes] == [1.0, 0.5, 0.5, 1.0] * 2
+    for bad, word in (("0:q. 1:q", "overrun"), ("0:z", "length")):
+        try:
+            Song().section("E").voice("x").harmony("C C", slots="half",
+                                                   pattern=bad)
+            raise AssertionError("pattern check did not fire")
+        except CompositionError as e:
+            assert word in str(e), e
+
+
+def test_map_notes_rewrites_each_note():
+    tune = "a4q b4 {c5 d5 e5}q +g4 a4q |"
+    out = map_notes(tune, lambda n: [chord_tone_below(n.pitch, "Am"),
+                                     n.pitch])
+    assert out == ("[en4 an4]q [en4 bn4] {[an4 cn5] [an4 dn5] [cn5 en5]}q"
+                   " +g4 [en4 an4]q |")
+    v = Song().section("V").voice("m")
+    v.bars(out)                                   # it parses as written
+    assert v.notes[0].pitches == [64, 69]
+    seen = []
+    map_notes("c4e d4 e4 f4 | g4h a4h |", lambda n: seen.append(n) or None)
+    assert [(n.pitch, n.beats, n.at, n.bar) for n in seen][4:] == \
+        [(67, 2.0, 2.0, 1), (69, 2.0, 4.0, 1)]
+    # sticky octaves are written out; an empty list is a rest
+    assert map_notes("c5q d e", lambda n: None) == "c5q d5 e5"
+    assert map_notes("c4q d e f", lambda n: [] if n.pitch == 62 else None) \
+        == "c4q r e4 f4"
+    try:
+        map_notes("c5h% c5h", lambda n: [n.pitch - 12, n.pitch])
+        raise AssertionError("trill check did not fire")
+    except CompositionError as e:
+        assert "trill" in str(e)
+
+
+def test_chord_tone_below():
+    assert chord_tone_below(72, "C") == 67             # G under C, a fourth
+    assert chord_tone_below(72, "C", gap=6) == 64      # E, at least a tritone
+    assert chord_tone_below(69, "Dm7") == 65           # F under A
+    assert chord_tone_below(60, "C/G") == 55           # the slash bass counts
+
+
+def test_same_shape_and_find_a_motif():
+    hook = "a4e. g#4s a4e. b4s a4e. g4s e4e. g4s"
+    assert same_shape(hook, "b4e. a#4s b4e. c#5s b4e. a4s f#4e. a4s")
+    assert not same_shape(hook, "b4e. a4s b4e. c5s b4e. a4s f4e. a4s")
+    assert not same_shape(hook, "a4e. g#4s a4e. b4s a4q e4e. g4s")
+    # the same onsets with shorter notes: articulation, not a new motif
+    assert same_shape(hook, "a4e rs g#4s a4s re b4s a4e. g4s e4e. g4s")
+    s = Song()
+    a = s.section("A")
+    a.voice("rh").bars(hook + " | " + transpose(hook, 5) + " |")
+    a.voice("lh").bars("c3w | f2w |")
+    b = s.section("B")
+    b.voice("rh").bars(double(hook, 7) + " | c5w |")     # in octaves
+    b.voice("lh").bars("c3w | c3w |")
+    s.arrange("A B")
+    got = [(f["section"], f["voice"], f["at"], f["semitones"])
+           for f in s.find(hook)]
+    assert got == [("A", "rh", "bar 1 beat 1", 0),
+                   ("A", "rh", "bar 2 beat 1", 5),
+                   ("B", "rh", "bar 1 beat 1", 12)]
+    assert s.find(hook, only="A") == s.find(hook)[:2]
+
+
+def test_rubs_follow_the_pedal():
+    def song(pedal=None, rh="b4q rq rh |", lh="rh c4h |"):
+        s = Song(expressive=False, humanize=0)
+        sec = s.section("A")
+        sec.voice("rh").bars(rh)
+        sec.voice("lh").bars(lh)
+        if pedal:
+            sec.pedal(pedal)
+        s.arrange("A")
+        return s
+    assert song().rubs(quiet=True) == []            # released before c4
+    held = song("bar").rubs(quiet=True)             # the pedal holds b4 on
+    assert held == ["[A] rub lh/rh at bar 1 beat 3: cn4 against bn4 "
+                    "(major seventh), ringing together 2 beats"]
+    assert song("half").rubs(quiet=True) == []      # changed at beat 3
+    notated = song(rh="ped b4q rq rh |")            # a notated pedal too
+    assert len(notated.rubs(quiet=True)) == 1
+    grace = song("bar", rh="+c#5 d5q rq rh |", lh="c5h rh |")
+    assert any("cn5 against c#5 (minor second)" in f
+               for f in grace.rubs(quiet=True))     # the grace rings on
+    assert song("bar").report()["rubs"] == held
+
+
+def test_from_midi_reads_a_song_back():
+    import shutil
+    import tempfile
+    s = Song(tempo=96, time="3/4", key="F", title="Round Trip")
+    a = s.section("A")
+    a.voice("rh", vel=70).bars("ped f5q a5q c6q | {bb5 a5 g5}q f5h lift |"
+                               " [a4 c5 f5]h. |")
+    a.voice("lh", vel=50).bars("f3h. | c3h. | f2h. |")
+    a.drums("kit", vel=60).bars("bdq hh hh | bdq hh hh | bdh. |")
+    s.ritardando("A", 3, 3, 72)
+    s.arrange("A")
+    d = tempfile.mkdtemp()
+    try:
+        back = Song.from_midi(s.save(os.path.join(d, "round.mid")))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    sec = back.sections["MIDI"]
+    assert (back.title, back.tempo, back.time_sig, back.key) == \
+        ("Round Trip", 96.0, "3/4", "F")
+    assert back.chords(per="bar") == [dict(c, section="MIDI")
+                                      for c in s.chords(per="bar")]
+    roles = {v.name.split(".")[1]: v for v in sec.voices}
+    assert set(roles) == {"rh", "lh", "kit"} and roles["kit"].drums
+    struck, t = [], 0.0
+    for n in roles["rh"].notes:          # rendered notes release early,
+        if n.pitches:                    # so short rests sit between them
+            struck.append((round(t, 4), n.pitches))
+        t += n.beats
+    assert struck[:6] == [(0.0, [77]), (1.0, [81]), (2.0, [84]),
+                          (3.0, [82]), (3.3333, [81]), (3.6667, [79])]
+    assert [k for _b, k in roles["rh"].pedal_marks] == ["ped", "lift"]
+    assert sec.bar_count() == 3 and back._tempo_changes
+
+
+def test_from_midi_reads_files_it_did_not_write():
+    import shutil
+    import tempfile
+
+    import mido
+    meta, msg = mido.MetaMessage, mido.Message
+    mid = mido.MidiFile(type=1, ticks_per_beat=96)
+    mid.tracks.append(mido.MidiTrack([          # untitled conductor track
+        meta("set_tempo", tempo=mido.bpm2tempo(176), time=0),
+        meta("set_tempo", tempo=mido.bpm2tempo(120), time=0),   # in force
+        meta("time_signature", numerator=4, denominator=4, time=0),
+        meta("set_tempo", tempo=mido.bpm2tempo(60), time=240),  # beat 3.5
+        meta("time_signature", numerator=4, denominator=4, time=144)]))
+    mid.tracks.append(mido.MidiTrack([
+        meta("track_name", name="Grand Piano", time=0),
+        msg("note_on", note=60, velocity=80, time=0),
+        msg("note_off", note=60, time=374),     # released before bar 2
+        msg("note_on", note=64, velocity=70, time=10),
+        msg("note_off", note=64, time=96),
+        msg("note_on", note=67, velocity=60, time=284),  # 4 ticks at the end
+        msg("note_off", note=67, time=4)]))
+    d = tempfile.mkdtemp()
+    try:
+        path = os.path.join(d, "outside.mid")
+        mid.save(path)
+        back = Song.from_midi(path)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    sec = back.sections["MIDI"]
+    assert back.title is None and back.tempo == 120.0 and sec.meters == {}
+    assert [v.name for v in sec.voices] == ["MIDI.grand_piano"]
+    assert sec.length_beats() == 8.0          # the short note stays inside
+    tempos = [(tk, round(a)) for tk, kind, _ch, a, _b in back.events()
+              if kind == "tempo"]
+    assert (1200, 60) in tempos and all(b == 120 for tk, b in tempos
+                                        if tk < 1200)
 
 
 def test_random_songs_through_every_path():

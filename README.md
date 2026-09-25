@@ -125,6 +125,7 @@ stretch(frag, 2)            # augmentation (0.5 for diminution)
 rebar(frag, 3)              # re-insert barlines every 3 beats
 transpose(frag, 3)          # chromatic: up a minor third
 double(frag, -7)            # in octaves (the octave below added)
+map_notes(frag, fn)         # each note through a function of your own
 ```
 
 Explicit alterations travel with their scale degree under `shift` and
@@ -153,6 +154,35 @@ keeps each note's accidental, so it is exact; a third or a sixth takes
 the key signature, as a hand playing in thirds does. Chords double
 every member and tuplet members become chords.
 
+`map_notes(frag, fn, key="C")` is the general form of `double()`. It
+hands `fn` every note of the fragment, tuplet members included, as a
+`Mapped` with the note's MIDI `pitch`, its length in `beats`, its onset
+`at` in beats from the fragment's start, and its `bar`, counted from 0.
+Whatever `fn` returns is written back: a pitch, a list of pitches as a
+chord, an empty list for a rest, or `None` to keep the note. Rests,
+chords, grace notes, marks, dynamics, and onset anchors pass through,
+and every pitch comes back with its octave and accidental written out.
+With `chord_tone_below(pitch, symbol)`, the highest tone of a chord at
+least a minor third under a pitch, it voices a tune over a progression
+in one call:
+
+```python
+PROG = ["F", "C"]
+map_notes("a4q a4e b4e c5q a4q | g4q e4q c4h |",
+          lambda n: [chord_tone_below(n.pitch, PROG[n.bar]), n.pitch],
+          key="F")
+# '[fn4 an4]q [fn4 an4]e [fn4 bb4]e [an4 cn5]q [fn4 an4]q |
+#  [en4 gn4]q [cn4 en4]q [gn3 cn4]h |'
+```
+
+`same_shape(a, b, key="C")` says whether two fragments carry the same
+rhythm and the same intervals, one an exact chromatic transposition of
+the other, compared on the top note of each chord. Rhythm here means
+where the notes are struck, so a staccato restatement still matches.
+It checks that a motif was moved and not altered: `transpose(m, 5)`
+passes, while `shift(m, 1)` moves the tune through the scale, changes
+its intervals, and fails.
+
 ## Harmony
 
 ```python
@@ -177,15 +207,17 @@ Any figure the styles do not cover can be written as a `pattern`:
 indices into the chord's tone ladder, which is its tones stacked up by
 octaves with a slash bass at index 0, stepped `unit` beats at a time
 and repeated to fill each slot. `"0+4"` strikes two ladder tones at
-once and `"r"` rests. A rolling Rachmaninoff left hand in triplets, a
-Horowitz piccolo obbligato, or an Alberti bass in sixteenths is one
-line:
+once and `"r"` rests. A step may carry its own length after a colon,
+so a pattern can have a rhythm; steps without one take `unit`, and the
+steps must fill each slot exactly. A rolling Rachmaninoff left hand in
+triplets, a Horowitz piccolo obbligato, or a habanera bass is one line:
 
 ```python
 lh.harmony("Bbm Bbm/A Gb F7", slots="half", octave=2,
            pattern="0 2 3 4 3 2", unit=1/3)
 piccolo.harmony("Ab Eb7*2 Ab", octave=5, pattern="3 4 5 6 5 4 3 4",
                 unit=0.25)
+lh.harmony("Dm A7 Dm A7", octave=2, pattern="0:e. 4:s 2+3:e 2+3:e")
 ```
 
 Chord symbols repeat with `*` (`"Am*4"`). `slots="half"` places two
@@ -256,8 +288,10 @@ count from the first downbeat, as `lint()` does.
 
 ```python
 s.lint()      # collisions and parallels, located by bar and beat
-s.report()    # dict: sections, voices, ranges, density, duration, lint
+s.rubs()      # seconds and sevenths that ring together, pedal included
+s.report()    # dict: sections, voices, density, duration, lint, rubs
 s.chords()    # the harmony that sounds, beat by beat
+s.find(motif) # every exact statement of a motif, at any transposition
 ```
 
 `lint()` reports two things, each located by bar and beat: collisions,
@@ -283,15 +317,59 @@ progression you meant with the one you wrote.
  {'section': 'A', 'at': 'bar 2 beat 1', 'beats': 4.0, 'chord': 'G7'}]
 ```
 
+`rubs()` reports the dissonance a listener hears, which the
+counterpoint checks do not look for: notes of two voices a minor
+second, a major seventh, or a minor ninth apart that ring together for
+at least `min_beats` (half a beat by default). A note rings until its
+release, or, while the sustain pedal is down, until the pedal next
+changes, following the section's `pedal()` setting and its `ped` and
+`lift` marks. A passing tone the pedal catches under a chord is found
+where a dry performance would let it go, and a grace note counts,
+since under the pedal it rings on. Each finding names the voices, the
+notes as written, the interval, and how long they sound together:
+
+```python
+A.voice("rh").bars("e5e f5e g5q c6h | c6w |")
+A.voice("lh").bars("[c4 e4 g4]w | [c4 e4 g4]w |")
+A.pedal("bar")
+s.rubs()
+# [A] rub lh/rh at bar 1 beat 1.5: en4 against fn5 (minor ninth),
+#     ringing together 3.5 beats
+```
+
+Without the pedal the same bars report nothing, since the F sounds for
+less than half a beat. `rubs(only="A")` checks one section.
+
+`find(motif)` lists every place a motif sounds with its rhythm and
+every interval intact, at any exact transposition, compared on each
+voice's top notes with tied notes joined. Rhythm is where the notes
+are struck, so a staccato statement matches the motif as written. A
+statement altered in any interval or onset does not match, so after
+writing variations the finds show whether the theme survived them:
+
+```python
+>>> A.voice("rh").bars("c5e d5e e5q g5h | f5e' g5e' a5q c6h |"
+...                    " c5e d5e e5q f5h | c5w |")
+>>> A.voice("lh").bars("c3e d3e e3q g3h | f2w | g2w | c3w |")
+>>> s.find("c5e d5e e5q g5h")
+[{'section': 'A', 'voice': 'rh', 'at': 'bar 1 beat 1', 'semitones': 0},
+ {'section': 'A', 'voice': 'rh', 'at': 'bar 2 beat 1', 'semitones': 5},
+ {'section': 'A', 'voice': 'lh', 'at': 'bar 1 beat 1', 'semitones': -24}]
+```
+
+The third bar changes the last interval and is not reported.
+
 `report()`
 exists so an agent can check its own work programmatically. Each voice
 in it carries a pitch-class histogram, its out-of-key rate, the
 distribution of melodic intervals, bar-to-bar self-similarity, and a
-grace-note count, and its duration integrates the full tempo map:
+grace-note count, and its duration integrates the full tempo map. It
+also carries the lint findings and the rubs:
 
 ```python
 assert s.report()["duration_s"] < 180
 assert not s.report()["lint"]
+assert not s.report()["rubs"]
 ```
 
 The linter is advisory. Styles that double the tune and the
@@ -299,6 +377,35 @@ accompaniment on strong beats will trip the parallel checks on
 purpose; read the findings, keep the ones that are idiom, fix the
 ones that are accidents. When a texture doubles by design, pass
 `lint(mode="homophonic")` to keep only the collisions.
+
+## Reading MIDI
+
+`Song.from_midi(path)` reads a Standard MIDI File into a Song, so music
+scoremill did not write can be examined with the same tools, and
+transposed, engraved, or rendered again:
+
+```python
+s = Song.from_midi("examples/saltarello_alla_chico.mid")
+s.describe()                                # 40 bars, 6 voices, ~42s
+s.find("e5e a5e c6e b5e a5e g5e", key="Am") # the tune: bars 3, 11, 27
+s.chords(per="bar")
+s.rubs()
+```
+
+The file becomes one section, `"MIDI"`. Each track's notes, or each
+channel's when a track holds several, become voices named for the
+track. Notes struck together with the same length form a chord, and a
+note that overlaps the one before it goes to a further voice, `rh2`,
+`rh3`. Onsets and lengths snap to a twelfth of a beat (`grid=12`, which
+keeps sixteenths and triplets), and `grid=None` keeps every tick. The
+first track's name is the title, and the first tempo, meter, and key
+set the song's. A later change of meter on a barline becomes a
+`time_change()`, a later tempo a `tempo_change()` at its own tick, the
+sustain pedal `ped` and `lift` marks, and channel 10 a drum voice. The
+piece ends at its last release or at the end of its tracks, whichever
+is later. The notes enter as raw `Note` objects, each chord member
+keeping its own velocity, with expression off, so saving the song
+again gives back the file's notes to the grid and its tempo map.
 
 ## Engraving
 
@@ -339,7 +446,9 @@ tick merge into one.
 
 `Song`, `Voice`, the transforms, and the renderer are ordinary Python,
 importable a la carte; a `Voice`'s `notes` list accepts hand-built
-`Note` objects, which bypass notation validation.
+`Note` objects, which bypass notation validation. A `Note` may carry
+`vels`, one velocity per pitch in the order of its `pitches`, for a
+chord struck unevenly.
 
 Query helpers answer "what notes are in this?" without a Song, so an
 agent can reason about harmony directly: `chord_pitches("Cmaj9")`
@@ -463,11 +572,13 @@ which keepalive probes detect within about 25 seconds.
 `mcp_server.py` exposes scoremill to an MCP client such as Claude Code
 or Claude Desktop. Each build tool takes a JSON song spec, whose shape
 is in the server's docstring, and returns the report, the lint
-findings, a saved MIDI file, the LilyPond source, the raw event
-stream, or the chord analysis (`harmony_analysis`); `transform`,
-`harmonize_melody`, `chords`, `scale`, and `cheatsheet` cover the
-motif transforms and query helpers. A `CompositionError` comes back as
-`{"error": ...}`.
+findings, the rubs, the statements of a motif (`find_motif`), a saved
+MIDI file, the LilyPond source, the raw event stream, or the chord
+analysis (`harmony_analysis`). `analyze_midi` reads an existing MIDI
+file and returns its report, its chords, and optionally where a motif
+sounds. `transform`, `harmonize_melody`, `same_shape`, `chords`,
+`scale`, and `cheatsheet` cover the motif transforms and query
+helpers. A `CompositionError` comes back as `{"error": ...}`.
 
 ```
 pip install "scoremill[mcp]"
