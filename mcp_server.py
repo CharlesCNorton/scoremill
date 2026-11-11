@@ -53,19 +53,58 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:                                   # mcp 2
     from mcp.server.mcpserver import MCPServer as FastMCP
-except ImportError:                    # mcp 1
-    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    try:                               # mcp 1
+        from mcp.server.fastmcp import FastMCP
+    except ImportError:                # no mcp: the tools below stay plain
+        FastMCP = None                 # functions, importable without it
 
 import scoremill
 from scoremill import (CompositionError, Song, chord_pitches, double,
                        harmonize, invert, rebar, retro, scale_pitches, shift,
                        stretch, transpose, transpose_chords)
 
-mcp = FastMCP("scoremill")
+
+class _NoServer:
+    """Stands in for the server when the mcp package is not installed."""
+
+    def tool(self):
+        return lambda fn: fn
+
+    def run(self):
+        raise SystemExit('the MCP server needs the mcp package — '
+                         'pip install "scoremill[mcp]"')
+
+
+mcp = FastMCP("scoremill") if FastMCP else _NoServer()
+
+
+def _need(entry, key: str, where: str):
+    """A required entry of the spec, or an error that names it."""
+    if not isinstance(entry, dict) or key not in entry:
+        raise CompositionError(f'spec: {where} needs "{key}"')
+    return entry[key]
 
 
 def build_song(spec: dict) -> Song:
-    """Construct a Song from a JSON spec (see the module docstring)."""
+    """Construct a Song from a JSON spec (see the module docstring). A
+    spec of the wrong shape raises a CompositionError that says where."""
+    if not isinstance(spec, dict):
+        raise CompositionError(
+            "spec: the song is a JSON object (see the cheatsheet tool's "
+            "notation and this server's docstring for its shape)")
+    try:
+        return _build(spec)
+    except CompositionError:
+        raise
+    except (KeyError, TypeError, AttributeError, ValueError) as e:
+        raise CompositionError(
+            f"spec: {type(e).__name__}: {e} — sections and voices are "
+            f"lists of objects; see this server's docstring for the "
+            f"shape") from None
+
+
+def _build(spec: dict) -> Song:
     s = Song(tempo=spec.get("tempo", 100), time=spec.get("time", "4/4"),
              key=spec.get("key", "C"), pickup=spec.get("pickup", 0.0),
              humanize=spec.get("humanize", 0), swing=spec.get("swing", 0.5),
@@ -77,9 +116,11 @@ def build_song(spec: dict) -> Song:
              title=spec.get("title"), composer=spec.get("composer"),
              dynamics=spec.get("dynamics"))
     for sd in spec.get("sections", []):
-        sec = s.section(sd["name"], key=sd.get("key"), time=sd.get("time"))
+        sec = s.section(_need(sd, "name", "each section"),
+                        key=sd.get("key"), time=sd.get("time"))
         for tc in sd.get("time_changes", []):
-            sec.time_change(tc["bar"], tc["time"])
+            sec.time_change(_need(tc, "bar", "a time change"),
+                            _need(tc, "time", "a time change"))
         for vd in sd.get("voices", []):
             if vd.get("drums"):
                 v = sec.drums(vd.get("name", "kit"), vel=vd.get("vel", 70))
@@ -96,9 +137,16 @@ def build_song(spec: dict) -> Song:
             if h:
                 avoid = None
                 if h.get("avoid"):
-                    avoid = next((x for x in sec.voices
-                                  if x.name.endswith("." + h["avoid"])), None)
-                v.harmony(h["symbols"], style=h.get("style", "block"),
+                    avoid = next((x for x in sec.voices if x is not v
+                                  and x.name.split(".", 1)[1] == h["avoid"]),
+                                 None)
+                    if avoid is None:
+                        raise CompositionError(
+                            f"spec: harmony avoids voice '{h['avoid']}', "
+                            f"which section '{sec.name}' has not written "
+                            f"yet — list that voice before this one")
+                v.harmony(_need(h, "symbols", "a harmony"),
+                          style=h.get("style", "block"),
                           slots=h.get("slots", "bar"),
                           octave=h.get("octave", 3),
                           voicing=h.get("voicing", "plain"), avoid=avoid,
@@ -115,9 +163,11 @@ def build_song(spec: dict) -> Song:
             sw = sd["swing"]
             sec.swing(sw.get("amount", 0.62), sw.get("unit", "eighth"))
     for tc in spec.get("tempo_changes", []):
-        s.tempo_change(tc["section"], tc["bar"], tc["bpm"])
+        s.tempo_change(*(_need(tc, k, "a tempo change")
+                         for k in ("section", "bar", "bpm")))
     for r in spec.get("ritardando", []):
-        s.ritardando(r["section"], r["from"], r["to"], r["bpm"])
+        s.ritardando(*(_need(r, k, "a ritardando")
+                       for k in ("section", "from", "to", "bpm")))
     if spec.get("arrange"):
         s.arrange(spec["arrange"])
     return s
@@ -277,8 +327,9 @@ def harmonize_melody(fragment: str, symbols: str, key: str = "C",
                      slots: str = "bar") -> dict:
     """Voice a melody fragment as chords under chord symbols (one per
     bar, or per `slots` beats given as a number), string to string, with
-    the added notes chosen so that no voices, and none against the
-    optional `bass` fragment, move in consecutive fifths or octaves."""
+    the added notes chosen so that, wherever the chords leave a choice,
+    no voices, and none against the optional `bass` fragment, move in
+    consecutive fifths or octaves."""
     return _guard(lambda: {"result": harmonize(
         fragment, symbols, key, voices, bass=bass or None, slots=slots)})
 

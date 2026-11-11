@@ -10,12 +10,20 @@ below are headless, for agents and automation.
   python jukebox.py --track 3       # play one track to the end and exit
   python jukebox.py --all           # play the whole playlist in order
   python jukebox.py --dir myscores --port "FluidSynth"
+  python jukebox.py --library DIR   # a folder of MIDI files, not scripts
 
 Network play (jukebox on one host, instrument on another; the far host
 needs no MIDI hardware or backend):
 
   python jukebox.py --forward       # on the host with the instrument
   python jukebox.py --remote HOST   # stream playback there
+  python jukebox.py --forward --allow 192.0.2.0/24,127.0.0.1
+
+The forwarder takes no password: --allow names the addresses or
+networks that may connect (any other is turned away), and --bind the
+address it listens on. It relays notes, pedals and controllers, and
+holds back system-exclusive messages, which reconfigure an instrument,
+unless started with --sysex.
 
 The forwarder re-selects the instrument on each connection, so it can
 start before the instrument is powered on. The newest connection takes
@@ -28,6 +36,7 @@ so one script may contribute several tracks. Requires mido, and
 python-rtmidi for real output ports.
 """
 import glob
+import ipaddress
 import json
 import os
 import select
@@ -64,7 +73,11 @@ def midi_title(path):
     """The title a MIDI file gives in its opening track-name meta event
     (scoremill writes Song(title=) there), else pretty_title()."""
     try:
-        for msg in mido.MidiFile(path).tracks[0]:
+        try:                          # UTF-8 where the file is, else Latin-1
+            mid = mido.MidiFile(path, charset="utf-8")
+        except UnicodeDecodeError:
+            mid = mido.MidiFile(path)
+        for msg in mid.tracks[0]:
             if msg.type == "track_name" and msg.name.strip():
                 return msg.name.strip()
             if not msg.is_meta:
@@ -222,10 +235,11 @@ class _Relay:
     """The forwarder's current client: its socket, the output it plays,
     and a parser for its byte stream."""
 
-    def __init__(self, conn, addr, out):
+    def __init__(self, conn, addr, out, sysex=False):
         self.conn, self.addr, self.out = conn, addr, out
         self.parser = mido.Parser()
-        self.count = 0
+        self.sysex = sysex
+        self.count = self.held_back = 0
 
     def pump(self):
         """Relay what the client sent; False once it is gone."""
@@ -235,6 +249,9 @@ class _Relay:
                 return False
             self.parser.feed(data)
             for msg in self.parser:
+                if msg.type == "sysex" and not self.sysex:
+                    self.held_back += 1     # settings, not notes
+                    continue
                 self.out.send(msg)
                 self.count += 1
             return True
@@ -249,11 +266,29 @@ class _Relay:
         except Exception:
             pass
         self.conn.close()
-        print(f"client {self.addr[0]} disconnected ({self.count} messages)",
-              flush=True)
+        kept = (f", {self.held_back} system-exclusive held back"
+                if self.held_back else "")
+        print(f"client {self.addr[0]} disconnected ({self.count} messages"
+              f"{kept})", flush=True)
 
 
-def _attach(conn, addr, piano_port):
+def _allowed(host, nets):
+    """Whether a client address lies in one of the allowed networks."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in net for net in nets)
+
+
+def parse_allow(text):
+    """Networks from a comma-separated list of addresses and CIDR ranges
+    ('192.0.2.0/24,198.51.100.5')."""
+    return [ipaddress.ip_network(part.strip(), strict=False)
+            for part in text.split(",") if part.strip()]
+
+
+def _attach(conn, addr, piano_port, sysex=False):
     """Open the instrument for a new client. Returns a _Relay, or None
     after reporting why the instrument could not be opened."""
     try:
@@ -275,7 +310,7 @@ def _attach(conn, addr, piano_port):
         loop = "through" in target.lower()
         print(f"client {addr[0]} -> {target}"
               + (" (loopback: silent)" if loop else ""), flush=True)
-        return _Relay(conn, addr, mido.open_output(target))
+        return _Relay(conn, addr, mido.open_output(target), sysex)
     except Exception as e:
         # One bad connection or a busy/absent port must not bring the
         # forwarder down; report and keep listening.
@@ -285,7 +320,8 @@ def _attach(conn, addr, piano_port):
         return None
 
 
-def run_forwarder(bind_host, bind_port, piano_port=None):
+def run_forwarder(bind_host, bind_port, piano_port=None, allow=None,
+                  sysex=False):
     """Relay MIDI bytes from a network client to a local instrument.
     Re-selects the output on every new connection, so turning the
     instrument on between sessions just works. The newest connection
@@ -293,7 +329,12 @@ def run_forwarder(bind_host, bind_port, piano_port=None):
     displaces that client, so an idle or stale client never locks the
     others out and nothing queues up to play late. Every departure,
     whether a close, a displacement, or a peer that stops answering
-    keepalive probes, releases all notes and both pedals."""
+    keepalive probes, releases all notes and both pedals. The relay
+    takes no password, so `allow`, a list of networks (parse_allow),
+    names the only addresses that may connect: one outside it is turned
+    away without disturbing the client that holds the instrument.
+    System-exclusive messages, which set an instrument up where notes
+    only play it, are held back unless `sysex` is true."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((bind_host, bind_port))
@@ -307,11 +348,16 @@ def run_forwarder(bind_host, bind_port, piano_port=None):
             ready = select.select(watch, [], [])[0]
             if srv in ready:
                 conn, addr = srv.accept()
+                if allow is not None and not _allowed(addr[0], allow):
+                    print(f"client {addr[0]} refused: not in the allowed "
+                          f"networks", flush=True)
+                    conn.close()
+                    continue
                 if cur is not None:
                     print(f"client {cur.addr[0]} displaced by {addr[0]}",
                           flush=True)
                     cur.close()
-                cur = _attach(conn, addr, piano_port)
+                cur = _attach(conn, addr, piano_port, sysex)
             elif cur is not None and not cur.pump():
                 cur.close()
                 cur = None
@@ -382,22 +428,29 @@ class Player:
     def set_tempo(self, pct):
         self.tempo_pct = max(25, min(400, int(pct)))
 
+    def _send(self, msg):
+        """Send one message; the lock keeps the playing thread and the
+        controls from writing to the output at once."""
+        with self._lock:
+            self.out.send(msg)
+
     def set_volume(self, vol):
         self.volume = max(0, min(127, int(vol)))
         for ch in range(16):
-            self.out.send(mido.Message("control_change", channel=ch,
-                                       control=7, value=self.volume))
+            self._send(mido.Message("control_change", channel=ch,
+                                    control=7, value=self.volume))
 
     def set_voice(self, program):
         self.voice = max(0, min(127, int(program)))
         for ch in range(16):
             if ch == 9:
                 continue                      # channel 10 holds the drum kit
-            self.out.send(mido.Message("program_change", channel=ch,
-                                       program=self.voice))
+            self._send(mido.Message("program_change", channel=ch,
+                                    program=self.voice))
 
     def _panic(self):
-        release_all(self.out)
+        with self._lock:
+            release_all(self.out)
 
     def stop(self):
         self._stop.set()
@@ -417,42 +470,46 @@ class Player:
         reconnect = getattr(self.out, "reconnect", None)
         if reconnect:
             reconnect()
-        self._stop.clear()
+        # a flag of its own for each track: a thread slow to stop still
+        # finds its flag set after the next track has begun
+        self._stop = threading.Event()
         self.now = title or pretty_title(path)
-        self._thread = threading.Thread(target=self._run, args=(path,),
-                                        daemon=True)
+        self._thread = threading.Thread(target=self._run,
+                                        args=(path, self._stop), daemon=True)
         self._thread.start()
 
-    def _run(self, path):
+    def _run(self, path, stop):
         try:
             mid = mido.MidiFile(path)
         except Exception:
             self.now = None
             return
-        for ch in range(16):
-            self.out.send(mido.Message("control_change", channel=ch,
-                                       control=7, value=self.volume))
+        self.set_volume(self.volume)
         self.set_voice(self.voice)
         lost = False
+        # Each message is due a score interval after the one before it
+        # was due, not after it was sent, so the time spent sending and
+        # the overshoot of every sleep never add up into a slower tempo.
+        due = time.monotonic()
         try:
             for msg in mid:                       # msg.time is delta seconds
-                if self._stop.is_set():
+                if stop.is_set():
                     break
-                if msg.time:
-                    end = time.monotonic() + msg.time / tempo_factor(
-                        self.tempo_pct)
-                    while True:
-                        remaining = end - time.monotonic()
-                        if remaining <= 0 or self._stop.is_set():
-                            break
-                        time.sleep(min(remaining, 0.02))
-                if self._stop.is_set():
+                due += msg.time / tempo_factor(self.tempo_pct)
+                while True:
+                    remaining = due - time.monotonic()
+                    if remaining <= 0 or stop.is_set():
+                        break
+                    time.sleep(min(remaining, 0.02))
+                if remaining < -0.5:              # stalled (a sleeping host):
+                    due = time.monotonic()        # resume, do not catch up
+                if stop.is_set():
                     break
                 if msg.is_meta:
                     continue
                 if msg.type == "program_change":
                     continue                      # our voice override wins
-                self.out.send(msg)
+                self._send(msg)
                 if getattr(self.out, "lost", False):
                     lost = True                   # the forwarder let us go
                     break
@@ -462,7 +519,7 @@ class Player:
             self.now = None
             if self.on_lost:
                 self.on_lost()
-        elif not self._stop.is_set():
+        elif not stop.is_set():
             self.now = None
             if self.on_finish:
                 self.on_finish()
@@ -1032,12 +1089,16 @@ def main(argv):
     remote = None
     library = None
     bind = ("0.0.0.0", DEFAULT_FORWARD_PORT)
+    allow, sysex = None, False
     mode = "gui"
     track_n = None
     i = 0
     try:
         while i < len(argv):
             a = argv[i]
+            if a in ("-h", "--help"):
+                print(__doc__.strip())
+                return 0
             if a == "--dir":
                 i += 1
                 src_dir = argv[i]
@@ -1053,6 +1114,11 @@ def main(argv):
             elif a == "--bind":
                 i += 1
                 bind = _parse_hostport(argv[i], DEFAULT_FORWARD_PORT)
+            elif a == "--allow":
+                i += 1
+                allow = parse_allow(argv[i])
+            elif a == "--sysex":
+                sysex = True
             elif a == "--forward":
                 mode = "forward"
             elif a == "--list":
@@ -1070,11 +1136,13 @@ def main(argv):
         print(f"bad or missing value after {a!r} — usage: jukebox.py "
               f"[--dir D | --library D] [--port NAME] "
               f"[--remote HOST[:PORT]] [--bind HOST[:PORT]] "
+              f"[--allow NET[,NET...]] [--sysex] "
               f"[--forward | --list | --track N | --all]", file=sys.stderr)
         return 2
 
     if mode == "forward":
-        run_forwarder(bind[0], bind[1], piano_port=port)
+        run_forwarder(bind[0], bind[1], piano_port=port, allow=allow,
+                      sysex=sysex)
         return 0
 
     source = library if library else src_dir

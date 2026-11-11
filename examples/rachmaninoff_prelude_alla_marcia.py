@@ -10,58 +10,30 @@ dominant pedal back to the march, now fff with notated pedaling on the
 climax; and a coda where the march recedes under the soft pedal and a
 last arpeggio rises out of it."""
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song, chord_pitches
-
-LETTER = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
-ACCS = {"": 0, "n": 0, "#": 1, "b": -1, "##": 2, "bb": -2}
-FLATS = ["cn", "db", "dn", "eb", "en", "fn", "gb", "gn", "ab", "an", "bb", "bn"]
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.{0,2})?([~>'_^&]*)$")
-KEY_FLATS = {"b": -1, "e": -1, "a": -1}      # C minor / E-flat major
+from scoremill import Song, chord_pitches, double, map_notes, transpose
 
 
-def midi(l, a, o):
-    alter = ACCS[a] if a else KEY_FLATS.get(l, 0)
-    return 12 * (int(o) + 1) + LETTER[l] + alter
-
-
-def nm(m):
-    return f"{FLATS[m % 12]}{m // 12 - 1}"
-
-
-def filled(frag, symbol, strong=("q", "q.", "h", "h.", "w")):
+def filled(frag, symbol):
     """Put two chord tones of `symbol` under every strong melody note
-    (a quarter or longer), leaving the quick notes single."""
+    (a quarter or longer), leaving the quick notes single. The fragment
+    is read in C minor."""
     pcs = {p % 12 for p in chord_pitches(symbol)}
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m or (m.group(4) or "") not in strong:
-            out.append(tok)
-            continue
-        top = midi(*m.group(1, 2, 3))
-        below = [p for p in range(top - 1, top - 13, -1)
-                 if p % 12 in pcs and p % 12 != top % 12][:2]
-        chord = sorted(below) + [top]
-        out.append("[" + " ".join(map(nm, chord)) + "]"
-                   + m.group(4) + (m.group(5) or ""))
-    return " ".join(out)
+
+    def chord(n):
+        if n.beats < 1:
+            return None
+        under = [p for p in range(n.pitch - 1, n.pitch - 13, -1)
+                 if p % 12 in pcs and p % 12 != n.pitch % 12][:2]
+        return under + [n.pitch]
+    return map_notes(frag, chord, key="Cm")
 
 
 def octaves_up(frag):
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        p = midi(*m.group(1, 2, 3))
-        out.append(f"[{nm(p)} {nm(p + 12)}]" + (m.group(4) or "")
-                   + (m.group(5) or ""))
-    return " ".join(out)
+    """A line doubled at the octave above."""
+    return double(frag, 7)
 
 
 def join(items):
@@ -140,9 +112,7 @@ s.ritardando("B", 15, 17, 52)
 
 # ── B3: the cello sings, arpeggios above ──
 B3 = s.section("B3", key="Eb")
-tenor = [octaves_up(re.sub(r"(\D)(\d)", lambda m: m.group(1)
-                           + str(int(m.group(2)) - 2), t))
-         for t in SONG1]
+tenor = [octaves_up(transpose(t, -24, key="Eb")) for t in SONG1]
 tenor[7] = "[g2 g3]w^"
 B3.voice("tenor").bars(join(["!mf " + tenor[0]] + tenor[1:5]
                             + ["cresc " + tenor[5], "!f " + tenor[6],

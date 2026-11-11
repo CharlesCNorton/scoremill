@@ -12,55 +12,38 @@ notes, plain and then in octaves over a cimbalom bass; and a stretta
 that combines the themes, the aria returning in the bass under the
 galop's figuration, before a coda of contrary chromatic octaves."""
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song, chord_pitches, transpose
+from scoremill import (NOTE_RE, Song, chord_tone_below, map_notes, note_name,
+                       transpose)
 
-LETTER = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
-ACCS = {"#": 1, "b": -1, "n": 0, "##": 2, "bb": -2}
-NAMES = ["cn", "c#", "dn", "eb", "en", "fn", "f#", "gn", "g#", "an", "bb", "bn"]
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.{0,2})?([~>'_^&%]*)$")
 DUR = {"t": 0.125, "s": 0.25, "e": 0.5, "e.": 0.75, "q": 1, "q.": 1.5,
        "h": 2, "h.": 3, "w": 4}
 SPELL = {0.5: "e", 1: "q", 1.5: "q.", 2: "h", 3: "h."}
 
 
-def midi(l, a, o):
-    """Pitch of a written note; every note here carries its accidental,
-    so a plain letter is natural."""
-    return 12 * (int(o) + 1) + LETTER[l] + ACCS.get(a or "n", 0)
-
-
 def nm(m):
-    return f"{NAMES[m % 12]}{m // 12 - 1}"
-
-
-def below(m, symbol, gap=3):
-    pcs = {p % 12 for p in chord_pitches(symbol)}
-    return next(p for p in range(m - gap, m - 13, -1) if p % 12 in pcs)
+    """A MIDI pitch as a note name, spelled for D minor."""
+    return note_name(m, "Dm")
 
 
 def voiced(frag, fn, mark=""):
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        d = m.group(4) or ""
-        ps = sorted(set(fn(midi(*m.group(1, 2, 3)), d)))
-        body = nm(ps[0]) if len(ps) == 1 else "[" + " ".join(map(nm, ps)) + "]"
-        out.append(body + d + (m.group(5) or "") + mark)
-    return " ".join(out)
+    """Replace every single note with the chord fn(pitch, beats) returns,
+    adding `mark` to it. Every note here carries its accidental, so the
+    fragment is read without a signature."""
+    if mark:
+        frag = " ".join(
+            tok + mark if NOTE_RE.match(tok) and tok[0] != "r" else tok
+            for tok in frag.split())
+    return map_notes(frag, lambda n: fn(n.pitch, n.beats), key="C")
 
 
 def halves(frag):
     """Split a 4/4 bar into two 2/4 bars, tying a note across the middle."""
     first, second, pos = [], [], 0.0
     for tok in frag.split():
-        m = NOTE.match(tok)
+        m = NOTE_RE.match(tok)
         d = DUR[m.group(4)]
         name = "".join(x or "" for x in m.group(1, 2, 3))
         if pos + d <= 2 + 1e-9:
@@ -133,7 +116,7 @@ s.tempo_change("ARIA", 1, 63)
 A2 = s.section("ARIA2", key="F")
 A2.voice("rh").bars(join(dyn(
     [voiced(m, lambda p, d, h=h: [p, p + 12]
-            + ([below(p + 12, h)] if DUR[d] >= 1 else []))
+            + ([chord_tone_below(p + 12, h)] if d >= 1 else []))
      for m, h in zip(ARIA, AH[0::2])],
     {0: "!f", 8: "cresc", 12: "!ff", 13: "dim", 15: "!f"})))
 A2.voice("lh", vel=50).harmony(" ".join(AH), slots="half", octave=2,
@@ -184,7 +167,8 @@ C1.voice("lh").bars("!mp " + join([coro_bass(h) for h in COH]))
 s.tempo_change("CORO", 1, 116)
 C2 = s.section("CORO2", key="C", time="2/4")
 C2.voice("rh").bars(join(dyn(
-    [voiced(m, lambda p, d, h=h: [below(p, h.split("|")[0]), p, p + 12])
+    [voiced(m, lambda p, d, h=h: [chord_tone_below(p, h.split("|")[0]), p,
+                                  p + 12])
      for m, h in zip(CO, COH)], {0: "!f", 8: "cresc", 12: "!ff"})))
 C2.voice("lh").bars("!f " + join([coro_bass(h, octave=True) for h in COH]))
 s.tempo_change("CORO2", 1, 120)

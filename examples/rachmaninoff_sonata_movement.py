@@ -18,67 +18,36 @@ short-short-long cadence.
 Written in A minor, where the notation is plainest, and moved to
 B-flat minor at the end with song.transpose(1)."""
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song, chord_pitches, transpose
-
-LETTER = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
-ACCS = {"#": 1, "b": -1, "n": 0, "##": 2, "bb": -2}
-NAMES = ["cn", "c#", "dn", "d#", "en", "fn", "f#", "gn", "g#", "an", "a#", "bn"]
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.{0,2})?([~>'_^&]*)$")
-DUR = {"t": 0.125, "s": 0.25, "e": 0.5, "e.": 0.75, "q": 1, "q.": 1.5,
-       "h": 2, "h.": 3, "w": 4}
-
-
-def midi(l, a, o):
-    return 12 * (int(o) + 1) + LETTER[l] + ACCS.get(a or "n", 0)
+from scoremill import (Song, chord_tone_below, double, map_notes, note_name,
+                       transpose)
 
 
 def nm(m):
-    return f"{NAMES[m % 12]}{m // 12 - 1}"
-
-
-def below(m, symbol, gap=3):
-    pcs = {p % 12 for p in chord_pitches(symbol)}
-    return next(p for p in range(m - gap, m - 13, -1) if p % 12 in pcs)
+    """A MIDI pitch as a note name, spelled for A minor."""
+    return note_name(m, "Am")
 
 
 def chords_over(frag, h1, h2, full=False):
     """Melody as octave chords, the chord tone (two with `full`) under
     each quarter or longer, from h1 in the first half bar, h2 after."""
-    out, pos = [], 0.0
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        p, d = midi(*m.group(1, 2, 3)), m.group(4)
-        h = h1 if pos < 2 - 1e-9 else h2
-        tones = [p - 12, p]
-        if DUR[d] >= 1:
-            inner = below(p, h)
+    def voiced(n):
+        h = h1 if n.at < 2 - 1e-9 else h2
+        tones = [n.pitch - 12, n.pitch]
+        if n.beats >= 1:
+            inner = chord_tone_below(n.pitch, h)
             tones.append(inner)
             if full:
-                tones.append(below(inner, h))
-        out.append("[" + " ".join(map(nm, sorted(set(tones)))) + "]" + d
-                   + (m.group(5) or ""))
-        pos += DUR[d]
-    return " ".join(out)
+                tones.append(chord_tone_below(inner, h))
+        return tones
+    return map_notes(frag, voiced, key="Am")
 
 
 def octaves(frag, up=False):
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        p = midi(*m.group(1, 2, 3))
-        lo, hi = (p, p + 12) if up else (p - 12, p)
-        out.append(f"[{nm(lo)} {nm(hi)}]{m.group(4) or ''}{m.group(5) or ''}")
-    return " ".join(out)
+    """A line doubled at the octave below, or above."""
+    return double(frag, 7 if up else -7)
 
 
 def join(items):

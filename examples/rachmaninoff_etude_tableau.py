@@ -14,69 +14,27 @@ bells receding under the soft pedal.
 Written in D minor, where the notation is plainest, and moved to E-flat
 minor at the end with song.transpose(1)."""
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song, chord_pitches, transpose
-
-LETTER = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
-ACCS = {"#": 1, "b": -1, "n": 0, "##": 2, "bb": -2}
-NAMES = ["cn", "c#", "dn", "eb", "en", "fn", "f#", "gn", "g#", "an", "bb", "bn"]
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.{0,2})?([~>'_^&]*)$")
-DUR = {"s": 0.25, "e": 0.5, "e.": 0.75, "q": 1, "q.": 1.5, "h": 2, "h.": 3, "w": 4}
-
-
-def midi(l, a, o):
-    """Pitch of a written note in D minor (a plain b is B-flat)."""
-    alter = ACCS[a] if a else (-1 if l == "b" else 0)
-    return 12 * (int(o) + 1) + LETTER[l] + alter
-
-
-def nm(m):
-    return f"{NAMES[m % 12]}{m // 12 - 1}"
-
-
-def below(m, symbol, gap=3):
-    pcs = {p % 12 for p in chord_pitches(symbol)}
-    return next(p for p in range(m - gap, m - 13, -1) if p % 12 in pcs)
+from scoremill import Song, chord_tone_below, double, map_notes, transpose
 
 
 def chords_over(frag, h1, h2, full=False):
     """A bar of melody as octave chords: each note with its octave below,
     and on quarters and longer the chord tone under it (two with
-    `full`), from h1 in the first half of the bar and h2 in the second."""
-    out, pos = [], 0.0
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        p = midi(*m.group(1, 2, 3))
-        d = m.group(4)
-        h = h1 if pos < 2 - 1e-9 else h2
-        tones = [p - 12, p]
-        if DUR[d] >= 1:
-            inner = below(p, h)
+    `full`), from h1 in the first half of the bar and h2 in the second.
+    The bar is read in D minor."""
+    def voiced(n):
+        h = h1 if n.at < 2 - 1e-9 else h2
+        tones = [n.pitch - 12, n.pitch]
+        if n.beats >= 1:
+            inner = chord_tone_below(n.pitch, h)
             tones.append(inner)
             if full:
-                tones.append(below(inner, h))
-        out.append("[" + " ".join(map(nm, sorted(set(tones)))) + "]" + d
-                   + (m.group(5) or ""))
-        pos += DUR[d]
-    return " ".join(out)
-
-
-def octaves_below(frag):
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        p = midi(*m.group(1, 2, 3))
-        out.append(f"[{nm(p - 12)} {nm(p)}]{m.group(4) or ''}{m.group(5) or ''}")
-    return " ".join(out)
+                tones.append(chord_tone_below(inner, h))
+        return tones
+    return map_notes(frag, voiced, key="Dm")
 
 
 def join(items):
@@ -145,7 +103,7 @@ units = [(0, "Dm Dm/C Bb Gm/Bb"), (3, "Fm Fm/Eb Db Bbm/Db"),
          (6, "G#m G#m/F# E C#m/E"), (9, "Bm Bm/A G Em/G")]
 seq = []
 for n, _h in units:
-    seq += octaves_below(transpose(motif, n, key="Dm")).split(" | ")
+    seq += double(transpose(motif, n, key="Dm"), -7).split(" | ")
 bells_rh = ["[dn5 f5 a5 dn6]h> [c#5 en5 a5 c#6]h>",
             "[c5 f5 a5 c6]h> [bn4 dn5 g5 bn5]h>",
             "[bb4 dn5 g5 bb5]h> [a4 c#5 en5 a5]h>",

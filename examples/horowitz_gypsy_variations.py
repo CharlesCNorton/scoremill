@@ -16,24 +16,16 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song
+from scoremill import NOTE_RE, Song, map_notes, note_name, note_pitch
 
-LETTER = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
-ACCS = {"": 0, "n": 0, "#": 1, "b": -1, "##": 2, "bb": -2}
-NAMES = ["cn", "c#", "dn", "d#", "en", "fn", "f#", "gn", "g#", "an", "a#", "bn"]
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.?)?([~>'_^&]*)$")
 SIXTEENTHS = {"s": 1, "e": 2, "e.": 3, "q": 4, "q.": 6, "h": 8}
 HARMONIC = {9, 11, 0, 2, 4, 5, 8}      # A B C D E F G#
 NATURAL = {9, 11, 0, 2, 4, 5, 7}       # A B C D E F G
 
 
-def to_midi(letter, acc, octave):
-    return 12 * (int(octave) + 1) + LETTER[letter] + ACCS[acc or ""]
-
-
 def nm(m):
     """A note name with an explicit accidental, so no key applies."""
-    return f"{NAMES[m % 12]}{m // 12 - 1}"
+    return note_name(m, "Am")
 
 
 def step(m, k, pcs):
@@ -44,18 +36,13 @@ def step(m, k, pcs):
 
 
 def voiced(frag, fn, mark=""):
-    """Replace every single note with the chord fn(midi) returns."""
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        l, a, o, d, marks = m.groups()
-        ps = sorted(set(fn(to_midi(l, a, o))))
-        body = nm(ps[0]) if len(ps) == 1 else "[" + " ".join(map(nm, ps)) + "]"
-        out.append(body + (d or "") + marks + mark)
-    return " ".join(out)
+    """Replace every single note with the chord fn(midi) returns, adding
+    `mark` to it."""
+    if mark:
+        frag = " ".join(
+            tok + mark if NOTE_RE.match(tok) and tok[0] != "r" else tok
+            for tok in frag.split())
+    return map_notes(frag, lambda n: fn(n.pitch), key="Am")
 
 
 def double_thirds(frag, pcs):
@@ -63,13 +50,12 @@ def double_thirds(frag, pcs):
     upper neighbor, keeping the melody's rhythm on the beat."""
     out = []
     for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
+        m = NOTE_RE.match(tok)
+        if not m or m.group(1) == "r":
             out.append(tok)
             continue
-        l, a, o, d, _marks = m.groups()
-        x = to_midi(l, a, o)
-        for i in range(SIXTEENTHS[d]):
+        x = note_pitch(m.group(1) + (m.group(2) or "") + m.group(3), "Am")
+        for i in range(SIXTEENTHS[m.group(4)]):
             y = x if i % 2 == 0 else step(x, 1, pcs)
             out.append(f"[{nm(step(y, -2, pcs))} {nm(y)}]s")
     return " ".join(out)

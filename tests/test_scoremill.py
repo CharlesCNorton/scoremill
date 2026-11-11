@@ -1593,6 +1593,461 @@ def test_from_midi_reads_files_it_did_not_write():
                                         if tk < 1200)
 
 
+def test_harmonize_writes_no_parallels_among_its_voices():
+    # Three voices over chords that leave a choice: no two of them move
+    # in consecutive fifths or octaves, whichever of the two is the upper.
+    import random
+    rng = random.Random(7)
+    for _trial in range(40):
+        prog = [rng.choice(["C", "F", "G", "Am", "Dm", "Em", "G7", "Dm7"])
+                for _ in range(4)]
+        tune = []
+        for sym in prog:
+            pcs = {p % 12 for p in chord_pitches(sym)}
+            pool = [p for p in range(67, 86) if p % 12 in pcs]
+            tune.append(" ".join(note_name(rng.choice(pool)) + "q"
+                                 for _ in range(4)))
+        v = Song(pitch_range=(0, 127)).section("H").voice("m")
+        v.bars(harmonize(" | ".join(tune) + " |", " ".join(prog)))
+        chords = [sorted(n.pitches) for n in v.notes]
+        for a, b in zip(chords, chords[1:]):
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    if a[i] != b[i] and a[j] != b[j]:
+                        was, now = (a[j] - a[i]) % 12, (b[j] - b[i]) % 12
+                        assert not (was == now and was in (0, 7)), (prog, a, b)
+
+
+def test_transpose_leaves_drum_voices_alone():
+    s = Song()
+    sec = s.section("A")
+    sec.voice("m").bars("c4q d4q e4q f4q |")
+    sec.drums("kit").bars("bdq sn bd sn |")
+    s.arrange("A")
+    s.transpose(2)
+    assert [n.pitches for n in sec.voices[0].notes][:2] == [[62], [64]]
+    assert [n.pitches for n in sec.voices[1].notes] == [[36], [38], [36], [38]]
+    for bad in (1.5, None, "2", float("inf")):
+        try:
+            s.transpose(bad)
+            raise AssertionError(f"whole-number check did not fire: {bad!r}")
+        except CompositionError as e:
+            assert "whole number" in str(e)
+    assert [n.pitches for n in sec.voices[0].notes][:2] == [[62], [64]]
+
+
+def test_a_failed_call_leaves_the_voice_as_it_was():
+    s = Song()
+    sec = s.section("A")
+    v = sec.voice("m", vel=40)
+    v.bars("cresc c4w |")
+    before = [(n.pitches, n.beats, n.vel) for n in v.notes]
+    for bad in ("d4w | !f e4h |",                # a short bar, after a ramp
+                "M:3/4 d4h. | e4h. | f4w |",     # a meter declared, then a
+                "d4w | zz4q |"):                 # wrong bar; a stray token
+        try:
+            v.bars(bad)
+            raise AssertionError("bar check did not fire")
+        except CompositionError:
+            pass
+        assert [(n.pitches, n.beats, n.vel) for n in v.notes] == before
+        assert sec.meters == {} and v._cresc_from is not None
+    v.bars("d4w | !f e4w |")                     # the corrected text
+    assert abs(v.total_beats() - 12.0) < 1e-9
+    h = sec.voice("lh")
+    try:
+        h.harmony("C G7 Xq")
+        raise AssertionError("chord check did not fire")
+    except CompositionError:
+        pass
+    assert h.notes == []
+
+
+def test_voice_names_are_used_once_in_a_section():
+    s = Song()
+    sec = s.section("A")
+    rh = sec.voice("rh")
+    rh.bars("c5w |")
+    for again in (lambda: sec.voice("rh"), lambda: sec.drums("rh")):
+        try:
+            again()
+            raise AssertionError("duplicate voice check did not fire")
+        except CompositionError as e:
+            assert "already has a voice 'rh'" in str(e)
+    rh.bars("e5w |")                             # the way to continue it
+    assert s.section("B").voice("rh") is not rh  # another section is free
+    assert len(sec.voices) == 1 and rh.total_beats() == 8.0
+
+
+def test_transforms_read_onset_anchors():
+    frag = "c5e@0 d5e@1 e5q"
+    assert shift(frag, 2) == "e5e@0 f5e@1 g5q"
+    assert transpose(frag, 2) == "dn5e@0 en5e@1 f#5q"
+    assert invert(frag, "c5") == "c5e@0 b4e@1 a4q"
+    assert stretch(frag, 2) == "c5q@0 d5q@2 e5h"   # the onsets stretch too
+    v = Song(time="8/4").section("A").voice("m").absolute_onsets()
+    v.bars(stretch("c5e@0 d5e@1 e5q@3 |", 2))
+    assert [n.beats for n in v.notes if n.pitches] == [1.0, 1.0, 2.0]
+    assert abs(v.total_beats() - 8.0) < 1e-9
+    for fn, word in ((lambda: retro(frag), "anchors"),
+                     (lambda: rebar(frag, 4), "anchors"),
+                     (lambda: shift("c5q zzz", 1), "unrecognized"),
+                     (lambda: stretch("c5q zzz", 2), "unrecognized"),
+                     (lambda: shift("c5q@x", 1), "onset anchor"),
+                     (lambda: map_notes("c5q@x", lambda n: None),
+                      "onset anchor"),
+                     (lambda: same_shape("[c4 zz]q", "c4q"), "unreadable")):
+        try:
+            fn()
+            raise AssertionError("check did not fire: " + word)
+        except CompositionError as e:
+            assert word in str(e), e
+
+
+def test_stretch_follows_sticky_durations():
+    # a note that leans on the duration before it is stretched with it,
+    # and a fragment opens on a quarter, as a new voice does
+    assert stretch("c4 d4 e4h", 2) == "c4h d4 e4w"
+    assert stretch("c4e d4 e4 f4q g4", 2) == "c4q d4 e4 f4h g4"
+    assert stretch("{c4 d4 e4} f4h", 0.5) == "{c4 d4 e4}e f4q"
+    assert stretch("+d5 c5 e5", 2) == "+d5 c5h e5"
+    for factor in (0, -2, "2", None, float("nan")):
+        try:
+            stretch("c4q", factor)
+            raise AssertionError(f"factor check did not fire: {factor!r}")
+        except CompositionError as e:
+            assert "positive number" in str(e)
+    a = Song().section("A").voice("m")
+    a.bars("c4 d4 e4h |")
+    b = Song(time="8/4").section("B").voice("m")
+    b.bars(stretch("c4 d4 e4h", 2) + " |")
+    assert [n.beats * 2 for n in a.notes] == [n.beats for n in b.notes]
+
+
+def test_tempo_plans_are_checked():
+    s = Song(tempo=120)
+    s.section("A").voice("m").bars("c4w | c4w |")
+    for fn, word in ((lambda: s.tempo_change("Z", 1, 60), "unknown section"),
+                     (lambda: s.ritardando("Z", 1, 2, 60), "unknown section"),
+                     (lambda: s.tempo_change(["A"], 1, 60), "unknown section"),
+                     (lambda: s.tempo_change("A", 1, 0), "positive"),
+                     (lambda: s.tempo_change("A", 1, float("inf")), "positive"),
+                     (lambda: s.ritardando("A", 1, 2, -5), "positive"),
+                     (lambda: s.tempo_change("A", 0, 60), "count from 1"),
+                     (lambda: s.ritardando("A", 2, 1, 60), "before it")):
+        try:
+            fn()
+            raise AssertionError("tempo plan check did not fire: " + word)
+        except CompositionError as e:
+            assert word in str(e), e
+    assert s._tempo_changes == {} and s._ramps == []
+    assert s.report()["duration_s"] == 4.0
+
+
+def test_song_settings_are_checked():
+    for bad in ({"tempo": 0}, {"tempo": -60}, {"tempo": "fast"},
+                {"tempo": float("inf")}, {"tempo": float("nan")},
+                {"fermata": 0}, {"trill_rate": 0}, {"swing": 1.5},
+                {"pickup": -1}, {"humanize": 1.5},
+                {"humanize": float("inf")}, {"pitch_range": (60, 20)}):
+        try:
+            Song(**bad)
+            raise AssertionError(f"setting check did not fire: {bad}")
+        except CompositionError as e:
+            assert list(bad)[0].split("_")[0] in str(e), e
+    s = Song()
+    sec = s.section("A")
+    sec.voice("m").bars("c4w |")
+    s.tempo = 0                                    # assigned afterwards
+    for render in (s.events, s.report, lambda: s.save(os.devnull)):
+        try:
+            render()
+            raise AssertionError("render check did not fire")
+        except CompositionError as e:
+            assert "tempo" in str(e)
+    for fn, word in ((lambda: sec.pedal("beat"), "pedal"),
+                     (lambda: sec.pedal(True), "pedal"),
+                     (lambda: sec.swing("hard"), "swing"),
+                     (lambda: sec.rubato(0.05, phrase=0), "phrase"),
+                     (lambda: sec.rubato(2), "depth")):
+        try:
+            fn()
+            raise AssertionError("section check did not fire: " + word)
+        except CompositionError as e:
+            assert word in str(e), e
+    assert sec.pedal(None).pedal_mode is None      # None takes it off
+
+
+def test_bass_styles_stay_inside_the_chord():
+    for sym in ("C/E", "Bdim", "Caug", "Bm7b5", "F/A", "G7"):
+        tones = {p % 12 for p in chord_pitches(sym)}
+        for style in ("fifth", "broken", "stride", "waltz", "alberti"):
+            for voicing in ("plain", "rootless"):
+                v = Song().section("A").voice("x")
+                v.harmony(sym, style=style, voicing=voicing)
+                played = {p % 12 for n in v.notes for p in n.pitches}
+                assert played <= tones, (sym, style, voicing, played)
+    v = Song().section("B").voice("x")
+    v.harmony("C", style="stride")                 # root, then the fifth
+    assert [n.pitches for n in v.notes][::2] == [[36], [43]]
+    w = Song().section("C").voice("x")
+    w.harmony("C/E", style="stride")               # the bass, then the root
+    assert [n.pitches for n in w.notes][::2] == [[28], [36]]
+
+
+def test_render_follows_assigned_settings():
+    def song():
+        s = Song(tempo=100, humanize=0, expressive=False)
+        sec = s.section("A")
+        sec.voice("m").bars("c4e d4e e4e f4e g4h^ |")
+        sec.rubato(0.05)
+        s.arrange("A")
+        return s, sec
+    for change in (lambda s, sec: setattr(s, "swing", 0.66),
+                   lambda s, sec: setattr(s, "tempo", 50),
+                   lambda s, sec: setattr(s, "fermata", 3.0),
+                   lambda s, sec: setattr(s, "expressive", True),
+                   lambda s, sec: setattr(sec, "pedal_mode", "bar"),
+                   lambda s, sec: setattr(sec, "rubato_depth", 0.2),
+                   lambda s, sec: setattr(sec.voices[0], "channel", 3)):
+        s, sec = song()
+        before = s.events()
+        change(s, sec)
+        assert s.events() != before
+    s, sec = song()
+    s.events()
+    s.tempo = 50
+    fresh, _sec = song()
+    fresh.tempo = 50
+    assert s.report()["duration_s"] == fresh.report()["duration_s"]
+
+
+def test_lilypond_escapes_names():
+    s = Song(title='A "quoted" title')
+    s.section("A").voice('rh" } #(display "x") { "').bars("c4w |")
+    s.arrange("A")
+    ly = s.to_lilypond()
+    assert 'instrumentName = "rh\\" } #(display \\"x\\") { \\"" }' in ly
+    assert 'title = "A \\"quoted\\" title"' in ly
+    assert ly.count("{") == ly.count("}")
+    assert "#(display \"x\")" not in ly
+
+
+def test_lilypond_marks_each_tempo_once():
+    s = Song(tempo=100)
+    a = s.section("A")
+    a.voice("rh").bars("c5w | c5w |")
+    a.voice("lh").bars("c3w | c3w |")
+    s.section("B").voice("rh").bars("e5w |")
+    s.sections["B"].voice("lh").bars("e3w |")
+    s.arrange("A B A")
+    assert s.to_lilypond().count("\\tempo") == 1      # one, in one staff
+    s.tempo_change("A", 2, 60)
+    ly = s.to_lilypond()
+    # B opens back at the song tempo; the second A follows it there
+    assert ly.count("\\tempo 4 = 100") == 2 and ly.count("\\tempo 4 = 60") == 2
+    t = Song(tempo=100)
+    t.section("A").voice("m").bars("+d4 c4w | {c4 d4 e4}h c4h |")
+    t.tempo_change("A", 1, 72)                        # the opening tempo
+    t.tempo_change("A", 2, 90)
+    t.arrange("A")
+    ly = t.to_lilypond()
+    assert ly.count("\\tempo") == 2
+    # a mark stands ahead of the grace note or the tuplet it falls on
+    assert "\\tempo 4 = 72 \\grace { d'8 } c'1" in ly
+    assert "\\tempo 4 = 90 \\tuplet 3/2 {" in ly
+
+
+def test_lilypond_closes_a_hairpin_that_ends_with_the_voice():
+    s = Song()
+    s.section("A").voice("m").bars("!p cresc c4q d4q e4q f4q !f |")
+    s.arrange("A")
+    ly = s.to_lilypond()
+    assert "\\<" in ly and "s1*0\\!" in ly
+    t = Song()
+    t.section("A").voice("m").bars("!p cresc c4q d4q !f e4q f4q |")
+    t.arrange("A")
+    assert "s1*0\\!" not in t.to_lilypond()           # closed by its dynamic
+
+
+def test_lint_walks_two_voices_side_by_side():
+    # The walk reports exactly the collisions that comparing every note
+    # of one voice with every note of the other would.
+    import random
+    from scoremill import Note
+    rng = random.Random(3)
+    for _trial in range(25):
+        s = Song(pitch_range=(0, 127))
+        sec = s.section("A")
+        spans = []
+        for name in ("a", "b"):
+            v, t, mine = sec.voice(name), 0.0, []
+            while t < 24 - 1e-9:
+                beats = rng.choice([b for b in (0.5, 1.0, 2.0, 3.0)
+                                    if t + b <= 24 + 1e-9])
+                ps = rng.sample(range(60, 65), rng.randint(0, 2))
+                v.notes.append(Note(ps, beats, 60))
+                if ps:
+                    mine.append((t, t + beats, set(ps)))
+                t += beats
+            spans.append(mine)
+        want = set()
+        for s1, e1, p1 in spans[0]:
+            for s2, e2, p2 in spans[1]:
+                lo = max(s1, s2)
+                if min(e1, e2) - lo > 1e-6 and p1 & p2:
+                    want.add((round(lo, 6), frozenset(p1 & p2)))
+        got = s.lint(quiet=True, mode="homophonic")
+        assert len(got) == len(want), (len(got), len(want))
+        full = s.lint(quiet=True, mode="strict")       # every pass runs
+        assert len(full) >= len(got)
+        assert s.chords() == s.chords()
+
+
+def test_chords_reads_long_notes_across_windows():
+    s = Song()
+    sec = s.section("A")
+    sec.voice("rh").bars("e5q g5q c6h | d5q f5q b5h | c5w |")
+    sec.voice("lh").bars("[c3 g3]w~ | [c3 g3]h [g2 d3]h | [c3 g3]w |")
+    s.arrange("A")
+    assert [c["chord"] for c in s.chords(per="bar")] == ["C", "G7", "C"]
+    # the tied fifth still sounds under the first half of bar 2
+    assert [c["chord"] for c in s.chords(per="half")] == \
+        ["C", "G7sus4/C", "G", "C"]
+    beats = sum(c["beats"] for c in s.chords(per="beat"))
+    assert beats == 12.0                               # every window counted
+
+
+def test_jukebox_keeps_the_scores_tempo():
+    # A player that waits a score interval after each send falls behind
+    # by every sleep's overshoot; one that keeps the score's own clock
+    # does not, however coarse the sleep.
+    import shutil
+    import tempfile
+    import threading
+    import time
+    import mido
+    mid = mido.MidiFile(ticks_per_beat=480)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    for k in range(100):                               # about a second
+        track.append(mido.Message("note_on", note=60, velocity=40, time=5))
+        track.append(mido.Message("note_off", note=60, time=5))
+    d = tempfile.mkdtemp()
+    real = (jukebox.mido.get_output_names, jukebox.mido.open_output,
+            jukebox.time)
+
+    class Coarse:
+        monotonic = staticmethod(time.monotonic)
+
+        @staticmethod
+        def sleep(seconds):
+            time.sleep(seconds + 0.004)
+
+    jukebox.mido.get_output_names = lambda: ["Fake Piano"]
+    jukebox.mido.open_output = lambda name: _FakeOut(name)
+    jukebox.time = Coarse
+    try:
+        path = os.path.join(d, "ticks.mid")
+        mid.save(path)
+        length = mido.MidiFile(path).length
+        done = threading.Event()
+        player = jukebox.Player(on_finish=done.set)
+        start = time.monotonic()
+        player.play(path)
+        assert done.wait(10.0)
+        took = time.monotonic() - start
+        player.close()
+        assert took < length + 0.4, (took, length)     # 0.8 s late before
+    finally:
+        (jukebox.mido.get_output_names, jukebox.mido.open_output,
+         jukebox.time) = real
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_titles_and_names_in_any_script_survive_a_file():
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        for title, voice, raw in (
+                ("Prélude", "rh", b"Pr\xe9lude"),             # Latin-1
+                ("Prelude — Bells", "main — haute", None),
+                ("夜曲", "rh", None)):
+            s = Song(title=title, composer="Élise")
+            s.section("A").voice(voice).bars("c4w |")
+            s.arrange("A")
+            path = s.save(os.path.join(d, "t.mid"))
+            back = Song.from_midi(path)
+            assert back.title == title
+            assert jukebox.midi_title(path) == title
+            if raw:                       # written as it always was
+                with open(path, "rb") as fh:
+                    assert raw in fh.read()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_bars_count_on_after_harmony():
+    # written after a figured stretch, bars() knows which bar it is in:
+    # the meter of that bar applies, and no bar passes for a pickup
+    s = Song(time="4/4")
+    sec = s.section("A")
+    sec.time_change(3, "3/4")
+    lh = sec.voice("lh")
+    lh.harmony("C G")                              # bars 1 and 2
+    lh.bars("c3h. | g2h. |")                       # bars 3 and 4, in 3/4
+    assert abs(lh.total_beats() - 14.0) < 1e-9
+    v = Song(pickup=1).section("P").voice("lh")
+    v.harmony("C")                                 # the pickup rest, a bar
+    try:
+        v.bars("c3q |")                            # one beat is no bar here
+        raise AssertionError("bar check did not fire")
+    except CompositionError as e:
+        assert "expected 4.0" in str(e) and "bar 2" in str(e)
+
+
+def test_harmony_avoid_dodges_held_notes():
+    # a figure tone that would land on a pitch the avoided voice is
+    # holding moves away, as one struck with it does
+    for style in ("alberti", "arp", "broken", "block"):
+        s = Song()
+        sec = s.section("A")
+        rh = sec.voice("rh")
+        rh.bars("[a3 c4 e4]w | [g3 b3 d4]h [e4 g4]h |")
+        sec.voice("lh").harmony("Am G", style=style, avoid=rh)
+        s.arrange("A")
+        assert s.lint(quiet=True, mode="homophonic") == [], style
+
+
+def test_the_readme_opening_song_passes_its_own_checks():
+    from scoremill import GUIDE
+    s = Song(tempo=96, time="4/4", key="Am", humanize=1)
+    motif = "a4e c5e e5q d5e c5e"
+    a = s.section("A")
+    a.voice("rh", vel=52).bars(
+        f"!mp {motif} b4q | {shift(motif, -1)} a4q |"
+        "  e5q {d5 c5 b4}q g#4h |"
+        "  [a3 c4 e4]w^& |")
+    a.voice("lh", vel=36).harmony(
+        "Am G E7 Am", style="alberti", voicing="smooth", octave=2)
+    a.pedal("bar")
+    s.ritardando("A", 3, 4, 70)
+    s.arrange("A")
+    report = s.report()
+    assert not report["lint"] and not report["rubs"]
+    assert [c["chord"] for c in s.chords(per="bar")] == \
+        ["Am9", "G9", "E7", "Am"]
+    readme = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "README.md")
+    with open(readme, encoding="utf-8") as fh:
+        text = fh.read()
+    for line in ('"  e5q {d5 c5 b4}q g#4h |"',
+                 '"Am G E7 Am", style="alberti", voicing="smooth", octave=2'):
+        assert line in text, line                 # the song the README shows
+    assert 'lh.harmony("Am G E7 Am", style="alberti"' in GUIDE
+
+
 def test_random_songs_through_every_path():
     # Seeded random songs mixing tuplets, chords, graces, trills, ties,
     # fermatas, pedal marks, pickups, swing, rubato, ramps, and figured
@@ -1679,10 +2134,10 @@ class _FakeOut:
         pass
 
 
-def _start_forwarder(outs):
+def _start_forwarder(outs, **options):
     """Run a forwarder on a free loopback port whose instrument is a
     fresh _FakeOut per connection, appended to `outs`. Returns the port
-    and a function that restores mido."""
+    and a function that restores mido. `options` go to run_forwarder."""
     import socket
     import threading
     import time
@@ -1699,7 +2154,8 @@ def _start_forwarder(outs):
     port = probe.getsockname()[1]
     probe.close()
     threading.Thread(target=jukebox.run_forwarder,
-                     args=("127.0.0.1", port), daemon=True).start()
+                     args=("127.0.0.1", port), kwargs=options,
+                     daemon=True).start()
     time.sleep(0.3)
 
     def restore():
@@ -1858,6 +2314,105 @@ def test_player_reports_a_lost_forwarder():
     finally:
         restore()
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_forwarder_admits_only_the_addresses_it_is_given():
+    import socket
+    import time
+    nets = jukebox.parse_allow("192.0.2.0/24, 198.51.100.5")
+    assert jukebox._allowed("192.0.2.77", nets)
+    assert jukebox._allowed("198.51.100.5", nets)
+    assert not jukebox._allowed("192.0.3.77", nets)
+    assert not jukebox._allowed("198.51.100.6", nets)
+    assert not jukebox._allowed("not an address", nets)
+    outs = []
+    port, restore = _start_forwarder(outs, allow=nets)
+    try:
+        c = socket.create_connection(("127.0.0.1", port))
+        try:
+            c.sendall(bytes([0x90, 60, 64]))
+        except OSError:
+            pass                                  # already turned away
+        time.sleep(0.4)
+        assert outs == []                         # the instrument unopened
+        c.close()
+    finally:
+        restore()
+    outs = []
+    port, restore = _start_forwarder(
+        outs, allow=jukebox.parse_allow("198.51.100.5,127.0.0.1"))
+    try:
+        c = socket.create_connection(("127.0.0.1", port))
+        c.sendall(bytes([0x90, 60, 64]))
+        time.sleep(0.4)
+        assert len(outs) == 1
+        assert any(m.type == "note_on" for m in outs[0].sent)
+        c.close()
+    finally:
+        restore()
+
+
+def test_forwarder_holds_back_system_exclusive():
+    import socket
+    import time
+    gm_reset_then_a_note = bytes([0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7,
+                                  0x90, 60, 64])
+    for sysex, want in ((False, 0), (True, 1)):
+        outs = []
+        port, restore = _start_forwarder(outs, sysex=sysex)
+        try:
+            c = socket.create_connection(("127.0.0.1", port))
+            c.sendall(gm_reset_then_a_note)
+            time.sleep(0.4)
+            kinds = [m.type for m in outs[0].sent]
+            assert kinds.count("sysex") == want and "note_on" in kinds
+            c.close()
+        finally:
+            restore()
+
+
+def test_mcp_builds_a_song_and_names_what_a_spec_lacks():
+    import mcp_server
+
+    def call(tool, *args, **kwargs):
+        return getattr(tool, "fn", tool)(*args, **kwargs)
+
+    spec = {"tempo": 96, "key": "Am", "sections": [
+        {"name": "A", "pedal": "bar", "voices": [
+            {"name": "rh", "bars": "a4e c5e e5q d5e c5e b4q | a4w |"},
+            {"name": "lh", "harmony": {"symbols": "Am E7", "style": "broken",
+                                       "avoid": "rh"}}]}],
+        "tempo_changes": [{"section": "A", "bar": 2, "bpm": 80}],
+        "arrange": "A"}
+    song = mcp_server.build_song(spec)
+    assert song.sections["A"].pedal_mode == "bar"
+    assert [v.name for v in song.sections["A"].voices] == ["A.rh", "A.lh"]
+    report = call(mcp_server.report, spec)
+    assert "error" not in report and report["duration_s"] > 0
+    assert call(mcp_server.transform, "transpose", "c4q e4q", semitones=3) \
+        == {"result": "eb4q gn4q"}
+    one = {"name": "A", "voices": [{"name": "rh", "bars": "c4w |"}]}
+    for bad, word in (
+            ({"sections": [{"voices": []}]}, '"name"'),
+            ({"sections": "A"}, "spec"),
+            ("not an object", "JSON object"),
+            (dict(spec, tempo=0), "tempo"),
+            (dict(spec, tempo_changes=[{"section": "Z", "bar": 1,
+                                        "bpm": 60}]), "unknown section"),
+            (dict(spec, tempo_changes=[{"section": "A", "bar": 1}]), '"bpm"'),
+            ({"sections": [dict(one, voices=one["voices"] * 2)]},
+             "already has a voice"),
+            ({"sections": [{"name": "A", "voices": [
+                {"name": "lh", "harmony": {"symbols": "C", "avoid": "rh"}}]}]},
+             "avoids voice"),
+            ({"sections": [{"name": "A", "voices": [
+                {"name": "lh", "harmony": {"style": "block"}}]}]},
+             '"symbols"'),
+            ({"sections": [dict(one, voices=[{"name": "rh",
+                                              "bars": "c4q d4q e4q |"}])]},
+             "short by 1.0")):
+        out = call(mcp_server.report, bad)
+        assert "error" in out and word in out["error"], (bad, out)
 
 
 if __name__ == "__main__":

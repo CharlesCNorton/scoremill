@@ -17,41 +17,22 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song, chord_pitches
-
-LETTER = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
-ACCS = {"#": 1, "b": -1, "n": 0, "##": 2, "bb": -2}
-NAMES = ["cn", "c#", "dn", "d#", "en", "fn", "f#", "gn", "g#", "an", "a#", "bn"]
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.{0,2})?([~>'_^&]*)$")
-DUR = {"t": 0.125, "s": 0.25, "e": 0.5, "e.": 0.75, "q": 1, "q.": 1.5,
-       "h": 2, "h.": 3, "w": 4}
-
-
-def midi(l, a, o):
-    return 12 * (int(o) + 1) + LETTER[l] + ACCS.get(a or "n", 0)
+from scoremill import NOTE_RE, Song, chord_tone_below, map_notes, note_name
 
 
 def nm(m):
-    return f"{NAMES[m % 12]}{m // 12 - 1}"
-
-
-def below(m, symbol, gap=3):
-    pcs = {p % 12 for p in chord_pitches(symbol)}
-    return next(p for p in range(m - gap, m - 13, -1) if p % 12 in pcs)
+    """A MIDI pitch as a note name, spelled for A minor."""
+    return note_name(m, "Am")
 
 
 def voiced(frag, fn, mark=""):
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        d = m.group(4) or ""
-        ps = sorted(set(fn(midi(*m.group(1, 2, 3)), d)))
-        body = nm(ps[0]) if len(ps) == 1 else "[" + " ".join(map(nm, ps)) + "]"
-        out.append(body + d + (m.group(5) or "") + mark)
-    return " ".join(out)
+    """Replace every single note with the chord fn(pitch, beats) returns,
+    adding `mark` to it."""
+    if mark:
+        frag = " ".join(
+            tok + mark if NOTE_RE.match(tok) and tok[0] != "r" else tok
+            for tok in frag.split())
+    return map_notes(frag, lambda n: fn(n.pitch, n.beats), key="Am")
 
 
 def join(items):
@@ -109,7 +90,7 @@ def verbunkos(h):
 
 def filled(frag, h):
     return voiced(frag, lambda p, d: [p - 12, p]
-                  + ([below(p, h)] if DUR.get(d, 0) >= 1 else []))
+                  + ([chord_tone_below(p, h)] if d >= 1 else []))
 
 
 LA = s.section("LASSAN")
@@ -214,8 +195,8 @@ s.tempo_change("FRISKA3", 1, 152)
 # ── FRISKA 4: Prestissimo, chords traded between the hands ──
 F4 = s.section("FRISKA4", key="A", time="2/4")
 F4.voice("rh").bars(join(dyn(
-    [voiced(f, lambda p, d, h=h: [below(p, h), p, p + 12] if p + 12 <= 108
-            else [below(p, h), p])
+    [voiced(f, lambda p, d, h=h: [chord_tone_below(p, h), p, p + 12]
+            if p + 12 <= 108 else [chord_tone_below(p, h), p])
      for f, h in zip(F, FH)], {0: "!ff", 8: "cresc", 11: "!fff"})))
 F4.voice("lh").bars("!ff " + join(
     [f"(rs [{CIMB_BASS[h][0]}]s)*4" for h in FH]))

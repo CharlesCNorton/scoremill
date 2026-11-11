@@ -10,32 +10,18 @@ return with the melody in the cello register under syncopated chords,
 then in full chords over sixteenths; a coda of echoes over a B-flat
 pedal under the soft pedal."""
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song
-
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.?)?([~>'_^&]*)$")
+from scoremill import Song, double, transpose
 
 
-def shifted(frag, octaves_down=0, double=None):
-    """Move single notes down whole octaves; with `double` given as
-    +1 or -1, add the octave above or below."""
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        l, a, o, d, marks = m.groups()
-        a, o = a or "", int(o) - octaves_down
-        if double is None:
-            out.append(f"{l}{a}{o}{d or ''}{marks}")
-        else:
-            lo, hi = sorted((o, o + double))
-            out.append(f"[{l}{a}{lo} {l}{a}{hi}]{d or ''}{marks}")
-    return " ".join(out)
+def shifted(frag, octaves_down=0, add=None):
+    """Move a line down whole octaves with transpose(); with `add` given
+    as +1 or -1, double() it at the octave above or below."""
+    if octaves_down:
+        frag = transpose(frag, -12 * octaves_down, key="Bbm")
+    return frag if add is None else double(frag, 7 * add)
 
 
 def flow(t):
@@ -128,22 +114,22 @@ A.rubato(0.05, phrase=2, shape="arch")
 # ── B: D-flat, piu mosso ──
 B = s.section("B", key="Db")
 B.voice("rh").bars(" | ".join([
-    "!mf " + shifted("ab4q. db5e f5h", double=1),
-    shifted("f5q. eb5e db5q c5q", double=1),
-    shifted("db5q bb4q eb5q. c5e", double=1),
-    shifted("db5w", double=1),
-    "cresc " + shifted("f5q. gb5e ab5q bb5q", double=1),
-    shifted("gb5q. f5e eb5q c5q", double=1),
-    "!f " + shifted("ab5q. gn5e f5q db5q", double=1),
-    shifted("eb5q. f5e gb5q ab5q", double=1),
+    "!mf " + shifted("ab4q. db5e f5h", add=1),
+    shifted("f5q. eb5e db5q c5q", add=1),
+    shifted("db5q bb4q eb5q. c5e", add=1),
+    shifted("db5w", add=1),
+    "cresc " + shifted("f5q. gb5e ab5q bb5q", add=1),
+    shifted("gb5q. f5e eb5q c5q", add=1),
+    "!f " + shifted("ab5q. gn5e f5q db5q", add=1),
+    shifted("eb5q. f5e gb5q ab5q", add=1),
     "!ff [ab5 db6 f6 ab6]h. [cb6 f6 ab6 cb7]q",
     "[bb5 db6 gb6 bb6]q. [ab5 ab6]e [gb5 bb5 db6 gb6]q [bbb5 db6 gb6 bbb6]q",
     "cresc [ab5 db6 f6 ab6]q. [bb5 bb6]e [c6 eb6 gb6 c7]q [db6 gb6 ab6 db7]q",
     "!fff [eb6 gb6 bb6 eb7]h.> [db6 gb6 bb6 db7]q",
     "[cb6 eb6 gb6 cb7]h> [an5 c6 eb6 an6]h>",
-    "dim " + shifted("bb5q. c6e db6q bb5q", double=1),
-    shifted("gb5q. f5e eb5q c5q", double=1),
-    "!p " + shifted("db5h c5h", double=1),
+    "dim " + shifted("bb5q. c6e db6q bb5q", add=1),
+    shifted("gb5q. f5e eb5q c5q", add=1),
+    "!p " + shifted("db5h c5h", add=1),
 ]) + " |")
 B_HARM = ["Db", "Db", "Bbm", "Bbm", "Gb", "Ab7", "Db", "Db",
           "Db/F", "Gb", "Ebm7", "Ab7", "Fm", "Bbm", "Eb7", "Ab7",
@@ -167,7 +153,7 @@ s.ritardando("B", 14, 17, 50)
 
 # ── RETURN 1: the melody in the cello register, syncopated chords above ──
 R1 = s.section("RET1")
-tenor = [shifted(m, octaves_down=1, double=-1) for m in A_MEL[:8]]
+tenor = [shifted(m, octaves_down=1, add=-1) for m in A_MEL[:8]]
 tenor[0] = "!mf " + tenor[0]
 tenor[4] = "cresc " + tenor[4]
 tenor[6] = "!f " + tenor[6]
@@ -189,10 +175,10 @@ R1.rubato(0.04, phrase=2, shape="cradle")
 # ── RETURN 2: full chords over sixteenths ──
 R2 = s.section("RET2")
 R2.voice("rh").bars(" | ".join([
-    "!mf " + shifted(A_MEL[8], octaves_down=-1, double=-1),
-    shifted(A_MEL[9], octaves_down=-1, double=-1),
-    "cresc " + shifted(A_MEL[10], octaves_down=-1, double=-1),
-    shifted(A_MEL[11], octaves_down=-1, double=-1),
+    "!mf " + shifted(A_MEL[8], octaves_down=-1, add=-1),
+    shifted(A_MEL[9], octaves_down=-1, add=-1),
+    "cresc " + shifted(A_MEL[10], octaves_down=-1, add=-1),
+    shifted(A_MEL[11], octaves_down=-1, add=-1),
     "!ff [db6 f6 ab6 db7]h.> [c6 f6 ab6 c7]q",
     "[bb5 db6 gb6 bb6]h. [ab5 cb6 eb6 ab6]q",
     "dim [gb5 bb5 db6 gb6]q [f5 bb5 db6 f6]q [eb5 an5 c6 eb6]q [c5 f5 an5 c6]q",

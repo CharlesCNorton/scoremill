@@ -8,27 +8,10 @@ the tenor, filigree above and bass below (the three-hand effect); a
 chromatic cadenza; the theme in full chords; an accelerating coda of
 chromatic octaves and hammered cadences."""
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song
-
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.?)?([~>'_^&]*)$")
-
-
-def octaves(frag):
-    """Double every single note of a fragment an octave above."""
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        l, a, o, d, marks = m.groups()
-        a = a or ""
-        out.append(f"[{l}{a}{o} {l}{a}{int(o) + 1}]{d or ''}{marks}")
-    return " ".join(out)
+from scoremill import Song, double
 
 
 def waltz(bass, chord, stacc=True, bass_stacc=False):
@@ -97,7 +80,7 @@ theme.rubato(0.06, phrase=4, shape="arch")
 
 # ── VARIATION: octaves and runs ──
 var = s.section("VARIATION")
-v = [octaves(m) for m in MELODY]
+v = [double(m, 7) for m in MELODY]
 v[0] = "!mf " + v[0]
 v[1] = "+ab6 " + v[1]
 v[7] = "[f5 f6]q {c6 bb5 ab5 g5 f5 en5}q {db6 c6 bb5 ab5 g5 f5}q"
@@ -221,7 +204,7 @@ coda.voice("rh").bars(
     "!ff [c5 c6]q [db5 db6]q [c5 c6]q |"
     " [en5 en6]q [f5 f6]q [en5 en6]q |"
     " [g5 g6]q [ab5 ab6]q [g5 g6]q |"
-    " [bb5 bb6]q [c6 c7]q [bb5 bb6]q | " + octaves(RUN))
+    " [bb5 bb6]q [c6 c7]q [bb5 bb6]q | " + double(RUN, 7))
 coda.voice("lh").bars(
     "!ff " + waltz("[f1 f2]", "f3 ab3 c4") + " | "
     + waltz("[c2 c3]", "en3 g3 bb3") + " | "

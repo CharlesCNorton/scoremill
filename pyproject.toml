@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scoremill"
-version = "0.8.1"
+version = "0.8.2"
 description = "Text-notation MIDI composition library designed for language-model agents"
 readme = "README.md"
 license = "MIT"

@@ -12,46 +12,34 @@ interlocking chords traded between the hands, a held dominant and a
 cadenza; the trio grandioso; the break again; the trio fff with a
 countermelody in the bass octaves; and the stinger."""
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song, chord_pitches
-
-LETTER = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
-ACCS = {"#": 1, "b": -1, "n": 0, "##": 2, "bb": -2}
-FLATS = ["cn", "db", "dn", "eb", "en", "fn", "gb", "gn", "ab", "an", "bb", "bn"]
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.{0,2})?([~>'_^&]*)$")
-
-
-def midi(l, a, o):
-    return 12 * (int(o) + 1) + LETTER[l] + ACCS.get(a or "n", 0)
+from scoremill import (NOTE_RE, Song, chord_tone_below, map_notes, note_name,
+                       note_pitch)
 
 
 def nm(m):
-    return f"{FLATS[m % 12]}{m // 12 - 1}"
+    """A MIDI pitch as a note name, spelled for E-flat major."""
+    return note_name(m, "Eb")
 
 
 def voiced(frag, fn, mark=""):
-    """Replace every single note with the MIDI chord fn(pitch) returns.
-    Written pitches here always carry their accidental (or none, for C,
-    F and G, and for naturals written plainly)."""
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        ps = sorted(set(fn(midi(*m.group(1, 2, 3)), m.group(4) or "")))
-        body = nm(ps[0]) if len(ps) == 1 else "[" + " ".join(map(nm, ps)) + "]"
-        out.append(body + (m.group(4) or "") + (m.group(5) or "") + mark)
-    return " ".join(out)
+    """Replace every single note with the chord fn(pitch, beats) returns,
+    adding `mark` to it. Written pitches here always carry their
+    accidental (or none, for C, F and G, and for naturals written
+    plainly), so the fragment is read without a signature."""
+    if mark:
+        frag = " ".join(
+            tok + mark if NOTE_RE.match(tok) and tok[0] != "r" else tok
+            for tok in frag.split())
+    return map_notes(frag, lambda n: fn(n.pitch, n.beats), key="C")
 
 
 def tone_below(m, symbol, gap=3):
-    """The highest tone of `symbol` at least `gap` semitones under m."""
-    pcs = {p % 12 for p in chord_pitches(symbol.split("|")[0])}
-    return next(p for p in range(m - gap, m - 13, -1) if p % 12 in pcs)
+    """The highest tone of `symbol` (its first chord, where a bar holds
+    two) at least `gap` semitones under m."""
+    return chord_tone_below(m, symbol.split("|")[0], gap)
 
 
 def join(items):
@@ -119,7 +107,7 @@ OOM = {"Eb": ("eb2", "bb1", "g3 bb3 eb4"), "Bb7": ("bb1", "f2", "f3 ab3 dn4"),
 def octv(name):
     """A bass note doubled an octave below, or above where below would
     leave the keyboard."""
-    p = midi(name[0], name[1:-1], name[-1])
+    p = note_pitch(name)
     lo = p - 12 if p - 12 >= 21 else p
     return f"[{nm(lo)} {nm(lo + 12)}]"
 
@@ -145,7 +133,7 @@ def thick(p, d, h):
     """A melody note with its octave above and, on longer notes, the
     chord tone under it."""
     tones = [p, p + 12]
-    if d not in ("s",):
+    if d > 0.25:                       # longer than a sixteenth
         tones.append(tone_below(p, h))
     return tones
 

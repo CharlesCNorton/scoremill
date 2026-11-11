@@ -17,59 +17,47 @@ The variations are generated from the theme by voicing helpers, as a
 transcriber elaborates a tune; the fugato, the intermezzo, and the coda
 are written out."""
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scoremill import Song, chord_pitches, transpose
+from scoremill import (NOTE_RE, Song, harmonize, map_notes, note_name,
+                       note_pitch, transpose)
+from scoremill import chord_tone_below as below
 
-LETTER = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
-ACCS = {"#": 1, "b": -1, "n": 0, "##": 2, "bb": -2}
-NAMES = ["cn", "c#", "dn", "eb", "en", "fn", "f#", "gn", "g#", "an", "bb", "bn"]
-NOTE = re.compile(r"^([a-g])(##|bb|#|b|n)?(\d)([whqest]\.{0,2})?([~>'_^&%]*)$")
+KEY = "Dm"                  # the theme's key: a plain b is B-flat
 DUR = {"t": 0.125, "s": 0.25, "e": 0.5, "e.": 0.75, "q": 1, "q.": 1.5,
        "h": 2, "h.": 3, "w": 4}
+WRITTEN = {beats: d for d, beats in DUR.items()}
 
 
 def midi(l, a, o):
-    """Pitch of a written note in D minor: a plain b is B-flat."""
-    alter = ACCS[a] if a else (-1 if l == "b" else 0)
-    return 12 * (int(o) + 1) + LETTER[l] + alter
+    """Pitch of a written note in D minor."""
+    return note_pitch(f"{l}{a or ''}{o}", KEY)
 
 
 def nm(m):
-    return f"{NAMES[m % 12]}{m // 12 - 1}"
+    """A MIDI pitch as a note name, spelled for D minor."""
+    return note_name(m, KEY)
 
 
 def notes(frag):
     """(pitch, duration, marks) for each note of a fragment."""
     out = []
     for tok in frag.split():
-        m = NOTE.match(tok)
-        if m:
+        m = NOTE_RE.match(tok)
+        if m and m.group(1) != "r":
             out.append((midi(*m.group(1, 2, 3)), m.group(4), m.group(5) or ""))
     return out
 
 
-def below(m, symbol, gap=3):
-    """The highest tone of `symbol` at least `gap` semitones under m."""
-    pcs = {p % 12 for p in chord_pitches(symbol)}
-    return next(p for p in range(m - gap, m - 13, -1) if p % 12 in pcs)
-
-
 def voiced(frag, fn, mark=""):
-    """Replace every single note with the chord fn(pitch, duration)."""
-    out = []
-    for tok in frag.split():
-        m = NOTE.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        d = m.group(4) or ""
-        ps = sorted(set(fn(midi(*m.group(1, 2, 3)), d)))
-        body = nm(ps[0]) if len(ps) == 1 else "[" + " ".join(map(nm, ps)) + "]"
-        out.append(body + d + (m.group(5) or "") + mark)
-    return " ".join(out)
+    """Replace every single note with the chord fn(pitch, duration)
+    returns, adding `mark` to it."""
+    if mark:
+        frag = " ".join(
+            tok + mark if NOTE_RE.match(tok) and tok[0] != "r" else tok
+            for tok in frag.split())
+    return map_notes(frag, lambda n: fn(n.pitch, WRITTEN[n.beats]), key=KEY)
 
 
 def join(items):
@@ -199,76 +187,16 @@ s.ritardando("VAR3", 16, 17, 88)
 
 # ── IV: chorale, the pedal changed on every beat ──
 def chorale(frags, harms, line):
-    """Voice a melody, one fragment per 3/4 bar, as three-note chords:
-    each note with two tones of its bar's chord within an octave below
-    it. The inner voices are chosen over the whole passage by dynamic
-    programming, so that no two voices, and no voice against the bass
-    `line`, move in consecutive fifths or octaves, the inner voices move
-    smoothly, and each chord keeps its third."""
-    bass = [(3 * i + k, midi(n[0], n[1:-1], n[-1]))
-            for i, bar in enumerate(line) for k, n in enumerate(bar.split())]
-
-    def bass_at(t):
-        return [p for u, p in bass if u <= t + 1e-9][-1]
-
-    events, t = [], 0.0
-    for i, (frag, h) in enumerate(zip(frags, harms)):
-        t = 3.0 * i
-        for p, d, marks in notes(frag):
-            events.append((t, p, d, marks, h))
-            t += DUR[d]
-    states = []
-    for t, p, _d, _m, h in events:
-        tones = chord_pitches(h)
-        pcs = {x % 12 for x in tones}
-        third = (tones[1] if len(tones) > 1 else tones[0]) % 12
-        floor = bass_at(t)
-        cands = [x for x in range(p - 12, p) if x % 12 in pcs and x > floor]
-        opts = []
-        for x2 in cands:
-            for x1 in cands:
-                if x1 <= x2 or x1 - x2 < 2:
-                    continue
-                cost = 0.0
-                if third not in {x2 % 12, x1 % 12, p % 12}:
-                    cost += 3
-                if len({x2 % 12, x1 % 12, p % 12}) < 3:
-                    cost += 2
-                opts.append(((x2, x1, p), cost))
-        states.append(opts)
-
-    def moves(prev, cur, b0, b1):
-        cost = 0.0
-        lines = list(zip(prev, cur)) + [(b0, b1)]
-        for i in range(len(lines)):
-            for j in range(i + 1, len(lines)):
-                (u0, u1), (v0, v1) = lines[i], lines[j]
-                if u0 != u1 and v0 != v1:
-                    iv0, iv1 = (u0 - v0) % 12, (u1 - v1) % 12
-                    if iv0 == iv1 and iv0 in (0, 7):
-                        cost += 100
-        return cost + 0.5 * (abs(prev[0] - cur[0]) + abs(prev[1] - cur[1]))
-
-    best = [{v: (c, None) for v, c in states[0]}]
-    for k in range(1, len(events)):
-        t = events[k][0]
-        b0, b1 = bass_at(t - 1e-6), bass_at(t)
-        layer = {}
-        for v, c in states[k]:
-            layer[v] = min(((best[-1][u][0] + moves(u, v, b0, b1) + c, u)
-                            for u in best[-1]), key=lambda x: x[0])
-        best.append(layer)
-    v = min(best[-1], key=lambda x: best[-1][x][0])
-    chosen = []
-    for k in range(len(events) - 1, -1, -1):
-        chosen.append(v)
-        v = best[k][v][1]
-    chosen.reverse()
-    bars_out = [[] for _ in frags]
-    for (t, _p, d, marks, _h), v in zip(events, chosen):
-        bars_out[int(t // 3)].append(
-            "[" + " ".join(nm(x) for x in v) + "]" + d + marks)
-    return [" ".join(b) for b in bars_out]
+    """Voice a melody, one fragment per 3/4 bar, as three-note chords
+    over the walking bass `line`, with harmonize(): the two notes under
+    each melody note come from its bar's chord, chosen over the whole
+    passage so that no two voices, and no voice against the bass, move
+    in consecutive fifths or octaves, the inner voices move smoothly,
+    and each chord keeps its third. Returns the bars."""
+    bass = join(" ".join(n + "q" for n in bar.split()) for bar in line)
+    voiced = harmonize(join(frags), " ".join(harms), key="Dm", voices=3,
+                       bass=bass)
+    return voiced.rstrip(" |").split(" | ")
 
 
 v4 = s.section("VAR4")

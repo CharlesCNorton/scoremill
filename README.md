@@ -54,6 +54,7 @@ python examples/saltarello_alla_chico.py --play   # performs it
 ```
 pip install scoremill           # library (pulls mido)
 pip install scoremill[play]     # + python-rtmidi for real-time ports
+pip install git+https://github.com/CharlesCNorton/scoremill   # current source
 ```
 
 Or copy `scoremill.py` into your project — it is a single file — or
@@ -72,10 +73,10 @@ MOTIF = "a4e c5e e5q d5e c5e"               # three beats of material
 A = s.section("A")
 A.voice("rh", vel=52).bars(
     f"!mp {MOTIF} b4q | {shift(MOTIF, -1)} a4q |"
-    "  e5q {d5 c5 b4}q a4h |"               # triplet on beat two
+    "  e5q {d5 c5 b4}q g#4h |"              # triplet on beat two
     "  [a3 c4 e4]w^& |")                    # rolled final chord, fermata
 A.voice("lh", vel=36).harmony(
-    "Am G Am E7", style="broken", voicing="smooth")
+    "Am G E7 Am", style="alberti", voicing="smooth", octave=2)
 A.pedal("bar")
 s.ritardando("A", 3, 4, 70)
 s.arrange("A")
@@ -92,6 +93,11 @@ If a bar does not add up, the parse fails immediately and says so:
 voice 'A.rh' bar 2: has 3.0 beats, expected 4.0 — short by 1.0 beats (a 'q').
     bar was: d4e b4e c5q g4q
 ```
+
+A call that fails leaves the voice as it was, so the corrected bars are
+simply entered again. A voice's name is used once in a section: keep
+the `Voice` that `voice()` returned and call `bars()` on it again to
+continue it.
 
 ## Notation
 
@@ -137,7 +143,10 @@ sticky octaves and durations are written out first so the reversal
 cannot change what a token means. `stretch` changes durations and
 therefore the barring, so pair it with `rebar`, which re-inserts
 barlines at a chosen bar length and errors if a note would straddle
-one.
+one. A note that leans on a sticky duration is stretched with the rest
+(a fragment opens on a quarter, as a new voice does), and an onset
+anchor stays with its note under every transform, `stretch` moving it
+with the note.
 
 `transpose(frag, semitones, key="C")` is the chromatic counterpart of
 `shift`. It reads the fragment in `key` and spells each result by
@@ -145,7 +154,7 @@ interval, so up a minor third from B is D rather than C double-sharp,
 with explicit accidentals that read the same under any signature. To
 move a finished piece to another key, `song.transpose(semitones)`
 shifts every entered note in place and relabels the keys, raising if a
-note would leave the instrument range.
+note would leave the instrument range. Drum voices stay as they are.
 
 `double(frag, degrees)` thickens a line the way a pianist does:
 `double(tune, -7)` plays it in octaves, `double(tune, 7)` adds the
@@ -194,7 +203,10 @@ Twenty-six chord qualities (`m 7 maj7 m7 6 m6 dim dim7 m7b5 aug sus2
 sus4 9 maj9 m9 add9 mmaj7 m11 7sus4 9sus4 7b5 7#5 7b9 7#9 11 13`),
 slash basses (`C/G`), and eight accompaniment styles (`block root
 fifth waltz alberti arp broken stride`; waltz, stride, and broken fill
-fractional meters). `voicing=` chooses how each chord is spelled:
+fractional meters). The fifth, broken, and stride styles pair the bass
+with the chord's own fifth, diminished or augmented as the chord is, or
+with its root under a slash bass. `voicing=` chooses how each chord is
+spelled:
 `plain` (close position), `smooth` (inversions that minimize movement
 between chords), `shell` (root, third, and seventh), `rootless` (drop
 the root for a comping color), or `drop2` (lower the second voice from
@@ -229,11 +241,13 @@ its new key: `"Db Ab7/C Bbm"`.
 `harmonize(melody, symbols, key=, voices=3, bass=)` voices the melody
 itself as chords, string to string: each note becomes the top of a
 chord of `voices` notes drawn from the symbol under it. The added notes
-are chosen across the whole passage by dynamic programming, so no two
-voices, and no voice against the given bass line, move in consecutive
-fifths or octaves, the inner voices move as little as they can, and
-each chord keeps its third; a tied note keeps its chord, and rests,
-graces, trills, and marks pass through. It is the counterpart of
+are chosen across the whole passage by dynamic programming so that,
+wherever the chords leave a choice, no two voices, and no voice against
+the given bass line, move in consecutive fifths or octaves, the inner
+voices move as little as they can, and each chord keeps its third. Four
+voices drawn from a triad must double a tone, and a doubled line moves
+in octaves with the line it doubles. A tied note keeps its chord, and
+rests, graces, trills, and marks pass through. It is the counterpart of
 `lint()`: where the linter finds parallels in chords stacked by hand,
 `harmonize` does not write them.
 
@@ -243,8 +257,9 @@ rh.bars(harmonize(theme, "Dm A7 Dm C7 F C Dm A", key="Dm", bass=ground))
 
 `avoid=<voice>` makes the accompaniment melody-aware: chord tones that
 would double the named voice's pitch classes on a shared onset are
-dropped, and single figure tones that would collide at the exact
-unison move an octave away. When the song declares a pickup and the
+dropped, and no tone lands on a pitch that voice is sounding, struck or
+held: a single figure tone moves an octave away, and a chord leaves the
+tone out. When the song declares a pickup and the
 accompaniment voice is still empty, `harmony()` inserts the pickup
 rest itself; the rest gives way when the voices written by hand open
 on a downbeat, whichever is written first.
@@ -280,7 +295,11 @@ swing, so a straight verse can lead into a swung chorus, and
 dynamic mark to suit an instrument's touch.
 
 Tempo changes, ramps, and rubato belong to their section, and every
-section begins at the song tempo. In a section that opens with a
+section begins at the song tempo. A change or a ramp names a section
+that already exists. The song's settings are plain attributes, checked
+when the song is made and again at each render, so one assigned later
+(`s.tempo = 84`) takes effect, and one that makes no sense raises a
+`CompositionError`. In a section that opens with a
 pickup, bar numbers, pedal changes, swing, and the downbeat lean all
 count from the first downbeat, as `lint()` does.
 
@@ -567,6 +586,16 @@ next play. Every departure releases all notes and both pedals,
 including a client that vanishes without closing its connection,
 which keepalive probes detect within about 25 seconds.
 
+The forwarder takes no password. `--allow 192.0.2.0/24,127.0.0.1`
+names the addresses or networks that may connect, any other being
+turned away without disturbing the client that holds the instrument,
+and `--bind HOST[:PORT]` the address it listens on. It relays notes,
+pedals, and controllers, and holds back system-exclusive messages,
+which reconfigure an instrument, unless started with `--sysex`. The
+player keeps the score's own clock, so a slow sender or a coarse timer
+can delay a note but never the tempo. `python jukebox.py --help` lists
+every flag.
+
 ## MCP server
 
 `mcp_server.py` exposes scoremill to an MCP client such as Claude Code
@@ -578,7 +607,8 @@ analysis (`harmony_analysis`). `analyze_midi` reads an existing MIDI
 file and returns its report, its chords, and optionally where a motif
 sounds. `transform`, `harmonize_melody`, `same_shape`, `chords`,
 `scale`, and `cheatsheet` cover the motif transforms and query
-helpers. A `CompositionError` comes back as `{"error": ...}`.
+helpers. A `CompositionError` comes back as `{"error": ...}`, as does a
+spec of the wrong shape, which names the entry it lacks.
 
 ```
 pip install "scoremill[mcp]"

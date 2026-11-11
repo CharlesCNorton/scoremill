@@ -89,8 +89,11 @@ MOTIF TRANSFORMS (string to string)
   harmonize(frag, symbols, key, voices=3, bass=)
                            each melody note the top of a chord, the
                            added notes chosen over the whole passage so
-                           no voices, nor any against the bass, move in
+                           that, where the chords leave a choice, no
+                           voices, nor any against the bass, move in
                            consecutive fifths or octaves
+  An onset anchor (c5e@3) stays with its note under every transform;
+  stretch moves it with the note.
   map_notes(frag, fn, key) each note rewritten by fn, which receives a
                            Mapped (pitch, beats, at, bar) and returns a
                            pitch, a list of pitches (a chord), [] (a
@@ -116,8 +119,9 @@ HARMONY
   splits a 3/4 bar 1 + 2 with "Dm A7 ."). voicing="smooth" selects
   inversions that minimize movement from
   the previous chord. avoid=<voice> drops accompaniment chord tones
-  that would double that voice's pitch classes on a shared onset and
-  re-octaves figure tones that would collide at the unison. When the
+  that would double that voice's pitch classes on a shared onset, and
+  keeps every tone off a pitch that voice is sounding, struck or held
+  (a figure tone moves an octave, a chord leaves it out). When the
   song has a pickup and the voice is empty, harmony inserts the pickup
   rest itself; the rest gives way when the voices written by hand open
   on a downbeat, whichever is written first.
@@ -205,7 +209,9 @@ RECOMMENDED WORKFLOW
 """
 from __future__ import annotations
 
+import bisect
 import itertools
+import numbers
 import re
 import sys
 import time
@@ -213,7 +219,7 @@ from collections import namedtuple
 
 import mido
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 TPB = 480
 PIANO_LO, PIANO_HI = 21, 108
@@ -284,6 +290,20 @@ def _ly_spelled(letter: str, alter: int, octv: int) -> str:
     """A written spelling in LilyPond's english names: ef', css''."""
     return (letter + ("s" * alter if alter > 0 else "f" * -alter)
             + _ly_octave(octv))
+
+
+def _ly_string(text) -> str:
+    """Text as a LilyPond string, its quotes and backslashes escaped, so
+    a title or a voice name can never end the string it is written in."""
+    return ('"' + " ".join(str(text).split()).replace("\\", "\\\\")
+            .replace('"', '\\"') + '"')
+
+
+def _real(x) -> bool:
+    """Whether x is a finite real number; True and False are not."""
+    return (isinstance(x, numbers.Real) and not isinstance(x, bool)
+            and float("-inf") < x < float("inf"))
+
 
 CHORD_QUALITY = {
     "": (0, 4, 7), "m": (0, 3, 7), "7": (0, 4, 7, 10),
@@ -376,6 +396,19 @@ def _chord_tones(sym: str, octave: int, where: str) -> tuple[list[int], bool]:
     if bass_l:
         tones.insert(0, 12 * octave + _pc(bass_l.lower(), bass_a))
     return tones, has_bass
+
+
+def _alt_bass(sym: str) -> int:
+    """The pitch class a bass alternates with under a chord symbol: the
+    chord's fifth as its quality has it (diminished, perfect, or
+    augmented), or the chord's root under a slash bass."""
+    root_l, root_a, qual, bass_l, bass_a = SYM_RE.match(sym).groups()
+    root = _pc(root_l.lower(), root_a)
+    if bass_l and (_pc(bass_l.lower(), bass_a) - root) % 12:
+        return root % 12
+    fifth = next((iv for iv in CHORD_QUALITY[qual or ""] if iv in (6, 7, 8)),
+                 7)
+    return (root + fifth) % 12
 
 
 def chord_pitches(symbol: str, octave: int = 4) -> list[int]:
@@ -639,6 +672,23 @@ def _classify(tok: str):
     return "note", NOTE_RE.match(body), grace
 
 
+def _anchor(tok: str, who: str = "") -> tuple[str, str]:
+    """Split an onset anchor off a token: 'c5e@3' is ('c5e', '@3'), and a
+    token without one, or a dynamic, comes back whole. Every fragment
+    walker reads a token through this first, so an anchored note is
+    always read as the note it is."""
+    if "@" not in tok or tok.startswith("!") or tok in ("cresc", "dim"):
+        return tok, ""
+    base, _, at = tok.partition("@")
+    try:
+        float(at)
+    except ValueError:
+        raise CompositionError(
+            f"{who + ': ' if who else ''}bad onset anchor in '{tok}' "
+            f"(write 'c5e@3', a beat number after '@')") from None
+    return base, "@" + at
+
+
 def _map_note_token(tok, fn, state):
     kind, m, grace = _classify(tok)
     pre = "+" if grace else ""
@@ -651,11 +701,15 @@ def _map_note_token(tok, fn, state):
         parts = []
         for t in inner.split():
             nm = NOTE_RE.match(t)
-            if not nm:
-                raise CompositionError(f"transform: bad chord member '{t}'")
+            if not nm or nm.group(1) == "r":
+                raise CompositionError(
+                    f"{state['who']}: bad chord member '{t}' in {tok}")
             parts.append(_apply(nm, fn, state, dur=""))
         return pre + "[" + " ".join(parts) + "]" + dur + marks
-    if m is None or m.group(1) == "r":
+    if m is None:
+        raise CompositionError(
+            f"{state['who']}: unrecognized token '{tok}'." + _suggest(tok))
+    if m.group(1) == "r":
         return tok
     return pre + _apply(m, fn, state, dur=(m.group(4) or ""))
 
@@ -669,14 +723,19 @@ def _apply(nm, fn, state, dur):
     return f"{nl}{na}{no}{dur}{marks}"
 
 
-def _transform(frag, fn):
-    state = {"oct": 4}
+def _transform(frag, fn, who):
+    """Rewrite every pitch of a fragment through fn(letter, accidental,
+    octave); `who` names the transform in an error. Barlines, dynamics,
+    pedal and meter marks pass through, an onset anchor stays on its
+    note, and a token that is none of these is an error."""
+    state = {"oct": 4, "who": who}
     out = []
     for tok in _tokenize(frag):
         if _classify(tok)[0] in ("bar", "dyn", "cresc", "pedal", "meter"):
             out.append(tok)
             continue
-        out.append(_map_note_token(tok, fn, state))
+        base, anchor = _anchor(tok, who)
+        out.append(_map_note_token(base, fn, state) + anchor)
     return " ".join(out)
 
 
@@ -686,7 +745,7 @@ def shift(frag: str, degrees: int) -> str:
     def fn(letter, acc, octave):
         idx = octave * 7 + LETTERS.index(letter) + degrees
         return LETTERS[idx % 7], acc, idx // 7
-    return _transform(frag, fn)
+    return _transform(frag, fn, "shift")
 
 
 MIRROR_ACC = {"": "", "n": "n", "#": "b", "b": "#", "##": "bb", "bb": "##"}
@@ -703,7 +762,7 @@ def invert(frag: str, axis: str = "g4") -> str:
         idx = octave * 7 + LETTERS.index(letter)
         idx = 2 * a_idx - idx
         return LETTERS[idx % 7], MIRROR_ACC[acc], idx // 7
-    return _transform(frag, fn)
+    return _transform(frag, fn, "invert")
 
 
 # Letter steps that spell a transposition of N semitones (0-11): a minor
@@ -735,7 +794,7 @@ def transpose(frag: str, semitones: int, key: str = "C") -> str:
                 f"transpose: {letter}{acc}{octave} by {semitones} cannot be "
                 f"spelled on {nl.upper()}")
         return nl, _ALTER[alter], no
-    return _transform(frag, fn)
+    return _transform(frag, fn, "transpose")
 
 
 def double(frag: str, degrees: int = 7) -> str:
@@ -796,10 +855,7 @@ def double(frag: str, degrees: int = 7) -> str:
 
     out = []
     for tok in _tokenize(frag):
-        anchor = ""
-        if "@" in tok and not tok.startswith("!"):
-            tok, _, at = tok.partition("@")
-            anchor = "@" + at
+        tok, anchor = _anchor(tok, "double")
         kind, m, grace = _classify(tok)
         if kind in ("bar", "dyn", "cresc", "pedal", "meter"):
             out.append(tok)
@@ -911,11 +967,9 @@ def map_notes(frag: str, fn, key: str = "C") -> str:
 
     out = []
     for tok in _tokenize(frag):
-        anchor = ""
-        if "@" in tok and not tok.startswith("!"):
-            tok, _, at = tok.partition("@")
-            anchor = "@" + at
-            where["t"] = max(where["t"], float(at))
+        tok, anchor = _anchor(tok, "map_notes")
+        if anchor:
+            where["t"] = max(where["t"], float(anchor[1:]))
         kind, m, grace = _classify(tok)
         if kind in ("bar", "dyn", "cresc", "pedal", "meter"):
             if kind == "bar":
@@ -969,6 +1023,10 @@ def _line(frag: str, key: str) -> list:
     out, t = [], 0.0
 
     def pitch(nm):
+        if nm is None or nm.group(1) == "r":
+            raise CompositionError(
+                f"unreadable pitch in '{frag[:60]}' — a chord or tuplet "
+                f"member is a note name like 'c#5'")
         if nm.group(3):
             state["oct"] = int(nm.group(3))
         return 12 * (state["oct"] + 1) + _pc(nm.group(1), nm.group(2) or "",
@@ -1002,9 +1060,9 @@ def _line(frag: str, key: str) -> list:
                 state["tie"] = False
 
     for tok in _tokenize(frag):
-        if "@" in tok and not tok.startswith("!"):
-            tok, _, at = tok.partition("@")
-            t = max(t, float(at))
+        tok, anchor = _anchor(tok)
+        if anchor:
+            t = max(t, float(anchor[1:]))
         kind, m, grace = _classify(tok)
         if kind in ("bar", "dyn", "cresc", "pedal", "meter"):
             continue
@@ -1099,9 +1157,9 @@ def _timed(frag: str, key: str) -> list:
 
     for tok in _tokenize(frag):
         base, beats, ps = tok, 0.0, []
-        if "@" in tok and not tok.startswith("!"):
-            base, _, at = tok.partition("@")
-            t = max(t, float(at))
+        base, anchor = _anchor(tok)
+        if anchor:
+            t = max(t, float(anchor[1:]))
         kind, m, grace = _classify(base)
         if kind in ("bar", "dyn", "cresc", "pedal", "meter"):
             pass
@@ -1136,13 +1194,16 @@ def harmonize(frag: str, symbols: str, key: str = "C", voices: int = 3,
     the chord symbol sounding under it (one per bar, or per `slots`
     beats; '.' repeats and '*N' multiplies, as in harmony()) within
     `span` semitones below. The added notes are chosen over the whole
-    passage by dynamic programming: no two voices, and no voice against
-    `bass` (a fragment of the bass line, which they stay above), move in
-    consecutive fifths or octaves; the inner voices move as little as
-    they can; each chord keeps its third and avoids doubling. A tied
-    note keeps its chord. Rests, graces, chords, tuplets, trilled notes,
-    and marks pass through. `key` is the signature the fragment is read
-    in, and spells the added notes (with explicit accidentals)."""
+    passage by dynamic programming so that, wherever the chords leave a
+    choice, no two voices, and no voice against `bass` (a fragment of
+    the bass line, which they stay above), move in consecutive fifths or
+    octaves; the inner voices move as little as they can; each chord
+    keeps its third and avoids doubling. Four voices drawn from a triad
+    must double a tone, and a doubled line moves in octaves with the
+    line it doubles. A tied note keeps its chord. Rests, graces, chords,
+    tuplets, trilled notes, and marks pass through. `key` is the
+    signature the fragment is read in, and spells the added notes (with
+    explicit accidentals)."""
     if voices < 2:
         raise CompositionError("harmonize: voices is 2 or more")
     if slots != "bar":
@@ -1224,7 +1285,9 @@ def harmonize(frag: str, symbols: str, key: str = "C", voices: int = 3,
             for y in range(x + 1, len(pairs)):
                 (u0, u1), (v0, v1) = pairs[x], pairs[y]
                 if u0 != u1 and v0 != v1:
-                    iv0, iv1 = (u0 - v0) % 12, (u1 - v1) % 12
+                    # the distance between the two lines, whichever is
+                    # the upper: a fifth is 7 either way, a fourth is not
+                    iv0, iv1 = abs(u0 - v0) % 12, abs(u1 - v1) % 12
                     if iv0 == iv1 and iv0 in (0, 7):
                         cost += 100
         if len(pc) == len(cc):
@@ -1294,6 +1357,10 @@ def retro(frag: str) -> str:
             raise CompositionError(
                 "retro: remove ties from the fragment — a reversed tie "
                 "points the wrong way")
+        if "@" in t:
+            raise CompositionError(
+                "retro: remove '@' onset anchors from the fragment — a "
+                "note placed by its beat cannot be played backwards")
     state = {"oct": 4, "dur": "q"}
 
     def explicit_pitch(nm):
@@ -1382,14 +1449,20 @@ def stretch(frag: str, factor: float) -> str:
     augmenting and 0.5 diminishing. Each resulting duration must be
     spellable as one of w h q e s t x, with up to two dots; a factor that
     lands a note on a value that cannot be written is rejected, naming
-    the offending note and its would-be duration."""
-    if factor <= 0:
+    the offending note and its would-be duration. A note that leans on
+    a sticky duration is stretched with the rest (a fragment opens on a
+    quarter, as a new voice does), and an onset anchor moves with its
+    note: '@3' becomes '@6' under a factor of 2."""
+    if not (_real(factor) and factor > 0):
         raise CompositionError("stretch: factor must be a positive number")
+    state = {"dur": 1.0, "out": None}   # the sticky length read, and written
 
-    def stretch_dur(durtok, tok):
-        if not durtok:
-            return durtok
-        new = round(_dur_value(durtok) * factor, 6)
+    def stretched(durtok, tok):
+        """The duration to write: stretched, and written out wherever
+        the result's own sticky duration would not already give it."""
+        if durtok:
+            state["dur"] = _dur_value(durtok)
+        new = round(state["dur"] * factor, 6)
         name = _DUR_VALUE_TO_TOKEN.get(new)
         if name is None:
             raise CompositionError(
@@ -1397,27 +1470,35 @@ def stretch(frag: str, factor: float) -> str:
                 f"which is not spellable as w/h/q/e/s/t/x (dotted at most "
                 f"twice) — choose a factor whose result lands on a real "
                 f"duration")
-        return name
+        written = name if durtok or state["out"] != new else ""
+        state["out"] = new
+        return written
 
     out = []
     for tok in _tokenize(frag):
-        kind, m, grace = _classify(tok)
-        if kind in ("bar", "dyn", "cresc", "pedal", "meter"):
+        if _classify(tok)[0] in ("bar", "dyn", "cresc", "pedal", "meter"):
             out.append(tok)
             continue
-        pre = "+" if grace else ""
-        if kind == "tuplet":
-            out.append(pre + "{" + m.group(1) + "}"
-                       + stretch_dur(m.group(2) or "", tok))
+        base, anchor = _anchor(tok, "stretch")
+        if anchor:
+            anchor = f"@{float(anchor[1:]) * factor:.9g}"
+        kind, m, grace = _classify(base)
+        if m is None:
+            raise CompositionError(
+                f"stretch: unrecognized token '{tok}'." + _suggest(tok))
+        if grace:                     # a grace note carries no duration
+            out.append(base + anchor)
+        elif kind == "tuplet":
+            out.append("{" + m.group(1) + "}"
+                       + stretched(m.group(2) or "", tok) + anchor)
         elif kind == "chord":
-            nd = stretch_dur(m.group(2) or "", tok)
-            out.append(pre + "[" + m.group(1) + "]" + nd + (m.group(3) or ""))
-        elif m is not None:
-            nd = stretch_dur(m.group(4) or "", tok)
-            out.append(pre + (m.group(1) + (m.group(2) or "")
-                              + (m.group(3) or "") + nd + (m.group(5) or "")))
+            out.append("[" + m.group(1) + "]"
+                       + stretched(m.group(2) or "", tok)
+                       + (m.group(3) or "") + anchor)
         else:
-            out.append(tok)
+            out.append(m.group(1) + (m.group(2) or "") + (m.group(3) or "")
+                       + stretched(m.group(4) or "", tok)
+                       + (m.group(5) or "") + anchor)
     return " ".join(out)
 
 
@@ -1430,6 +1511,10 @@ def rebar(frag: str, beats_per_bar: float) -> str:
     toks = _tokenize(frag)
     if "|" in toks:
         raise CompositionError("rebar: fragment already contains barlines")
+    if any(_anchor(t, "rebar")[1] for t in toks):
+        raise CompositionError(
+            "rebar: the fragment places notes with '@' onset anchors, which "
+            "count from the start of a voice — write its barlines by hand")
 
     def dur_of(durtok, state):
         if durtok:
@@ -1597,7 +1682,44 @@ class Voice:
         self.absolute = on
         return self
 
+    def _saved(self) -> tuple:
+        """Everything a bars() or harmony() call can change, to put back
+        if the call fails."""
+        return (list(self.notes), [n.vel for n in self.notes], self._oct,
+                self._dur, self._vel, self._cresc_from, self._started,
+                list(self.pedal_marks), dict(self.dyn_marks),
+                dict(self.hairpins), list(self._spelled),
+                list(self.barlines), self._bars_done, self._pickup_first,
+                dict(self.section.meters) if self.section is not None
+                else None)
+
+    def _restore(self, saved: tuple) -> None:
+        (notes, vels, self._oct, self._dur, self._vel, self._cresc_from,
+         self._started, self.pedal_marks, self.dyn_marks, self.hairpins,
+         self._spelled, self.barlines, self._bars_done, self._pickup_first,
+         meters) = saved
+        self.notes[:] = notes          # in place: a caller may hold the list
+        for n, vel in zip(notes, vels):
+            n.vel = vel                # a hairpin rewrites earlier levels
+        if meters is not None:
+            self.section.meters.clear()
+            self.section.meters.update(meters)
+        self.song._dirty()
+
     def bars(self, text: str) -> "Voice":
+        """Enter notation (see the module docstring): notes, chords,
+        tuplets, graces, dynamics, pedal marks, and barlines, checked as
+        they are read. Calls add up, so a voice may be written a phrase
+        at a time. A call that raises leaves the voice as it was before
+        the call, so the corrected text can simply be entered again."""
+        saved = self._saved()
+        try:
+            return self._bars(text)
+        except BaseException:
+            self._restore(saved)
+            raise
+
+    def _bars(self, text: str) -> "Voice":
         self.song._dirty()
         beats_in_bar = 0.0
         first_bar = not self._started
@@ -1936,6 +2058,7 @@ class Voice:
         if "%" in marks:
             if len(pitches) != 1:
                 raise CompositionError("trill '%' works on single notes")
+            self.song._check_settings()
             unit = self.song.trill_rate
             k = int(beats / unit + 1e-9)
             if k < 3:
@@ -2026,7 +2149,10 @@ class Voice:
         """Render chord symbols as an accompaniment figure, one symbol
         per `slots`: "bar", "half", or a number of beats. `octave`
         places the chord roots and is independent of the octave the
-        voice uses for melodic input. `pattern`, in place of a style,
+        voice uses for melodic input. The fifth, broken, and stride
+        styles pair the bass with the chord's own fifth (diminished or
+        augmented as the chord is), or with its root under a slash
+        bass. `pattern`, in place of a style,
         figures each chord by indices into its tone ladder (the chord's
         tones stacked up by octaves, a slash bass at index 0): "0 2 4 5
         4 2" steps through the ladder `unit` beats at a time (1/3 for
@@ -2034,13 +2160,25 @@ class Voice:
         "0+4" strikes two ladder tones together. A step may carry its
         own length after a colon, so a pattern can have a rhythm: the
         habanera is "0:e. 4:s 2+3:e 2+3:e". `avoid` names another
-        Voice: chord tones that would double its pitch classes on a
-        shared onset are dropped, and single figure tones that would
-        collide at the exact unison move down an octave. When the song
+        Voice, written first: chord tones that would double its pitch
+        classes on a shared onset are dropped, and no tone lands on a
+        pitch that voice is sounding, struck or held (a single figure
+        tone moves an octave away, a chord leaves it out). When the song
         defines a pickup and this voice is still empty, the pickup rest
         is inserted automatically; it gives way when the voices written
         by hand open on a downbeat, whichever is written first. Symbols
-        repeat with '*': "Am*4"."""
+        repeat with '*': "Am*4". A call that raises leaves the voice as
+        it was before the call."""
+        saved = self._saved()
+        try:
+            return self._harmony(symbols, style, slots, octave, voicing,
+                                 avoid, pattern, unit)
+        except BaseException:
+            self._restore(saved)
+            raise
+
+    def _harmony(self, symbols, style, slots, octave, voicing, avoid,
+                 pattern, unit) -> "Voice":
         self.song._dirty()
         steps = None if pattern is None else self._parse_pattern(pattern)
         if unit <= 0:
@@ -2056,14 +2194,18 @@ class Voice:
                                        marks="pickup"))
         avoid_map = None
         if avoid is not None:
-            avoid_map = {}
+            # the avoided voice: what it strikes at each onset, and each
+            # of its notes as (start, end, pitches), in order
+            onsets, spans = {}, []
             t = 0.0
             for n in avoid.notes:
                 if n.grace:
                     continue
                 if n.pitches:
-                    avoid_map.setdefault(round(t, 6), set()).update(n.pitches)
+                    onsets.setdefault(round(t, 6), set()).update(n.pitches)
+                    spans.append((t, t + n.beats, set(n.pitches)))
                 t += n.beats
+            avoid_map = (onsets, [s[0] for s in spans], spans)
         if voicing not in ("plain", "smooth", "shell", "rootless", "drop2"):
             raise CompositionError(
                 "harmony: voicing is plain, smooth, shell, rootless, "
@@ -2116,8 +2258,19 @@ class Voice:
                 self._pattern(tones, has_bass, steps, unit, slot_beats, t0,
                               avoid_map)
             else:
-                self._figure(tones, style, slot_beats, t0, avoid_map)
+                self._figure(tones, style, slot_beats, t0, avoid_map,
+                             _alt_bass(sym))
             t0 += slot_beats
+        # bars() written after this counts on from the bars it filled,
+        # and reads its next bar as a full bar, not a pickup
+        self._started = True
+        if self.section is not None:
+            opened = self._pickup_first or (
+                self.notes and self.notes[0].marks == "pickup")
+            done, whole = self.section._walk(
+                self.song.pickup if opened else 0.0, self.total_beats())
+            if whole:
+                self._bars_done = len(done)
         return self
 
     @staticmethod
@@ -2189,21 +2342,39 @@ class Voice:
 
     def _emit(self, pitches, beats, vel, offset, t0, avoid_map, gate=0.92):
         """Append one accompaniment note at t0+offset, yielding to the
-        avoided voice: chords drop tones that double its pitch classes;
-        single tones dodge exact unisons by an octave."""
-        sounding = avoid_map.get(round(t0 + offset, 6)) if avoid_map else None
-        if sounding:
+        avoided voice: a chord drops the tones that double the pitch
+        classes it strikes at that onset; and no tone lands on a pitch
+        the avoided voice sounds, struck or held, while the tone lasts:
+        a single tone moves an octave away, a chord leaves it out."""
+        if avoid_map:
+            onsets, starts, spans = avoid_map
+            at = t0 + offset
+            struck = onsets.get(round(at, 6), ())
+            taken = set()                 # its pitches sounding meanwhile
+            k = max(0, bisect.bisect_right(starts, at + 1e-9) - 1)
+            while k < len(spans) and spans[k][0] < at + beats - 1e-6:
+                if spans[k][1] - at > 1e-6:
+                    taken |= spans[k][2]
+                k += 1
             if len(pitches) > 1:
-                classes = {p % 12 for p in sounding}
-                kept = [p for p in pitches if p % 12 not in classes]
-                if kept:
-                    pitches = kept
-            else:
+                clear = [p for p in pitches if p not in taken]
+                if not clear:             # every tone taken: move the chord
+                    for step in (-12, 12):
+                        moved = [p + step for p in pitches]
+                        if not taken & set(moved) and all(
+                                self.song.pitch_lo <= q <= self.song.pitch_hi
+                                for q in moved):
+                            clear = moved
+                            break
+                classes = {p % 12 for p in struck}
+                kept = [p for p in (clear or pitches)
+                        if p % 12 not in classes]
+                pitches = kept or clear or pitches
+            elif pitches[0] in taken:
                 p = pitches[0]
-                if p in sounding:
-                    moved = p - 12 if p - 12 >= self.song.pitch_lo else p + 12
-                    if moved not in sounding:
-                        pitches = [moved]
+                moved = p - 12 if p - 12 >= self.song.pitch_lo else p + 12
+                if moved not in taken:
+                    pitches = [moved]
         for p in pitches:
             if not self.song.pitch_lo <= p <= self.song.pitch_hi:
                 raise CompositionError(
@@ -2259,27 +2430,34 @@ class Voice:
                 core = sorted(core)
         return bass + core
 
-    def _figure(self, tones, style, beats, t0=0.0, avoid_map=None):
+    def _figure(self, tones, style, beats, t0=0.0, avoid_map=None,
+                alt_pc=None):
+        """Figure one chord in a style. `alt_pc` is the pitch class the
+        bass alternates with (see _alt_bass); the styles that add a
+        second bass tone take the nearest one above the lowest tone, so
+        every tone a style adds belongs to the chord."""
         v = self._vel
         root, top = tones[0], tones[1:]
+        alt = (root + 7 if alt_pc is None
+               else root + ((alt_pc - root) % 12 or 12))
         if style == "block":
             self._emit(tones, beats, v, 0.0, t0, avoid_map)
         elif style == "root":
             self._emit([root], beats, v, 0.0, t0, avoid_map)
         elif style == "fifth":
-            self._emit([root, root + 7], beats, v, 0.0, t0, avoid_map)
+            self._emit([root, alt], beats, v, 0.0, t0, avoid_map)
         elif style == "waltz":
             off = min(1.0, beats)
             self._emit([root], off, v, 0.0, t0, avoid_map)
-            chord = top if len(top) >= 2 else [root + 4, root + 7]
+            chord = top or [root + 12]
             while beats - off > 1e-6:
                 d = min(1.0, beats - off)
                 self._emit(chord, d, max(20, v - 8), off, t0, avoid_map)
                 off += d
         elif style in ("alberti", "arp"):
             if style == "alberti":
-                third = tones[1] if len(tones) > 1 else root + 4
-                fifth = tones[2] if len(tones) > 2 else root + 7
+                third = tones[1] if len(tones) > 1 else root
+                fifth = tones[2] if len(tones) > 2 else tones[-1]
                 seq = [root, fifth, third, fifth]
             else:
                 seq = tones + [root + 12]
@@ -2290,11 +2468,11 @@ class Voice:
             if beats - n * 0.5 > 1e-6:      # a slot of no whole eighths
                 self.notes.append(Note([], beats - n * 0.5, 0))
         elif style == "stride":
-            chord = [t + 12 for t in top] or [root + 16, root + 19]
+            chord = [t + 12 for t in top] or [root + 12]
             use_fifth = False
             b = 0.0
             while b < beats - 1e-6:
-                bass = root - 12 + (7 if use_fifth else 0)
+                bass = (alt if use_fifth else root) - 12
                 use_fifth = not use_fifth
                 d = min(1.0, beats - b)
                 self._emit([bass], d, v + 4, b, t0, avoid_map)
@@ -2307,7 +2485,7 @@ class Voice:
         elif style == "broken":
             self._emit([root], min(1.0, beats), v, 0.0, t0, avoid_map)
             if beats > 1 + 1e-6:
-                self._emit([root + 7], min(1.0, beats - 1.0),
+                self._emit([alt], min(1.0, beats - 1.0),
                            max(20, v - 6), 1.0, t0, avoid_map)
             rest = beats - 2
             if rest > 1e-6:
@@ -2417,10 +2595,25 @@ class Section:
         self.swing_amount = None      # None: the song's swing applies
         self.swing_unit = None
 
+    def _claim(self, name: str) -> str:
+        """The full name of a new voice, refusing one the section has: a
+        second voice of the same name would sound beside the first, not
+        continue it."""
+        full = f"{self.name}.{name}"
+        if any(v.name == full for v in self.voices):
+            raise CompositionError(
+                f"section '{self.name}' already has a voice '{name}' — to "
+                f"continue it, keep the Voice that voice() returned and "
+                f"call bars() on it again; a second line needs its own name")
+        return full
+
     def voice(self, name: str, vel: int = 50, octave: int = 4,
               program: int = 0, channel: int = 0,
               absolute: bool = False) -> Voice:
-        v = Voice(f"{self.name}.{name}", self.song, vel, octave,
+        """A new voice of the section: one line of music, a hand or an
+        instrument, named for its role (the MIDI track and the engraved
+        staff carry the name). Each name is used once in a section."""
+        v = Voice(self._claim(name), self.song, vel, octave,
                   key=self.key, program=program, channel=channel,
                   bpb=self.bpb, absolute=absolute)
         v.section = self
@@ -2435,7 +2628,7 @@ class Section:
         duration and sticky like any note, e.g.
         bars("bde hh sn hh | bd hh sn hh |"). Stacks play a kick and
         hat together, [bd hh]q, and '>' accents a hit."""
-        v = Voice(f"{self.name}.{name}", self.song, vel,
+        v = Voice(self._claim(name), self.song, vel,
                   channel=9, bpb=self.bpb, drums=True)
         v.section = self
         self.voices.append(v)
@@ -2444,7 +2637,13 @@ class Section:
 
     def pedal(self, mode: str | float = "bar") -> "Section":
         """Sustain pedal, re-applied every bar ("bar"), half bar
-        ("half"), or every N beats when given a number."""
+        ("half"), or every N beats when given a number; None takes it
+        off again."""
+        if mode is not None and mode not in ("bar", "half") and not (
+                _real(mode) and mode > 0):
+            raise CompositionError(
+                f'pedal: mode is "bar", "half", or a positive number of '
+                f'beats (got {mode!r})')
         self.pedal_mode = mode
         self.song._dirty()
         return self
@@ -2461,7 +2660,7 @@ class Section:
         place of the song's: a straight verse into a swung chorus."""
         if unit not in ("eighth", "sixteenth"):
             raise CompositionError('swing: unit is "eighth" or "sixteenth"')
-        if not 0 < amount < 1:
+        if not (_real(amount) and 0 < amount < 1):
             raise CompositionError("swing: amount is between 0 and 1 "
                                    "(0.5 is straight)")
         self.swing_amount, self.swing_unit = amount, unit
@@ -2474,6 +2673,14 @@ class Section:
         the phrase and relaxes its end; "cradle" broadens mid-phrase."""
         if shape not in ("arch", "cradle"):
             raise CompositionError('rubato: shape is "arch" or "cradle"')
+        if not (_real(depth) and 0 <= depth < 0.5):
+            raise CompositionError(
+                f"rubato: depth is the share of the tempo given and taken, "
+                f"from 0 up to 0.5 (got {depth!r})")
+        if not (_real(phrase) and phrase > 0):
+            raise CompositionError(
+                f"rubato: phrase is a length in bars, a positive number "
+                f"(got {phrase!r})")
         self.rubato_depth = depth
         self.rubato_phrase = phrase
         self.rubato_shape = shape
@@ -2601,17 +2808,23 @@ class Section:
     def locate(self, t: float) -> str:
         """Render a section-relative beat offset as 'bar B beat N',
         accounting for a pickup and for meter changes."""
-        grid = self.bar_grid()
-        if not grid:
-            return f"bar 1 beat {t + 1:g}"
-        start, _beats, number, _time = grid[0]
-        for g in grid:
-            if t < g[0] - 1e-9:
-                break
-            start, _beats, number, _time = g
-        if number == 0:
-            return f"pickup beat {t + 1:g}"
-        return f"bar {number} beat {round(t - start, 6) + 1:g}"
+        return self._locator()(t)
+
+    def _locator(self, length: float | None = None):
+        """locate() for many beats of one section: a function of a beat,
+        the section's bars worked out once."""
+        grid = self.bar_grid(length)
+        starts = [g[0] for g in grid]
+
+        def where(t):
+            if not grid:
+                return f"bar 1 beat {t + 1:g}"
+            k = max(0, bisect.bisect_right(starts, t + 1e-9) - 1)
+            start, _beats, number, _time = grid[k]
+            if number == 0:
+                return f"pickup beat {t + 1:g}"
+            return f"bar {number} beat {round(t - start, 6) + 1:g}"
+        return where
 
     def variant(self, name: str, vel_scale: float = 1.0) -> "Section":
         """Return a copy of this section with velocities scaled. The copy
@@ -2704,10 +2917,11 @@ class Section:
                 raise CompositionError(
                     f"voice '{v.name}': a grace note at the end of the "
                     f"voice has no note to ornament")
-        lens = {v.name: v.total_beats() for v in self.voices}
-        vals = set(round(x, 4) for x in lens.values())
+        lens = [(v.name, v.total_beats()) for v in self.voices]
+        vals = set(round(x, 4) for _name, x in lens)
         if len(vals) > 1:
-            pretty = {k: f"{x / self.bpb:.2f} bars" for k, x in lens.items()}
+            pretty = ", ".join(f"{k} {x / self.bpb:.2f} bars"
+                               for k, x in lens)
             raise CompositionError(
                 f"section '{self.name}': voices differ in length: {pretty}")
         length = next(iter(vals)) if vals else 0.0
@@ -2870,6 +3084,44 @@ class Song:
         self._ramps = []           # (section, bar_from, bar_to, bpm_to)
         self._rev = 0              # bumped by every mutator; keys the cache
         self._events_cache = {}    # order -> (signature, (events, cursor))
+        self._check_settings()
+
+    def _check_settings(self) -> None:
+        """The song's own numbers, checked when the song is made and
+        again before every render: they are plain attributes, so one may
+        be assigned later."""
+        if not _real(self.tempo) or not self.tempo > 0:
+            raise CompositionError(
+                f"tempo is beats per minute, a positive number (got "
+                f"{self.tempo!r})")
+        if not _real(self.fermata) or not self.fermata > 0:
+            raise CompositionError(
+                f"fermata is how many times longer a held moment lasts, a "
+                f"positive number (got {self.fermata!r})")
+        if not _real(self.trill_rate) or not self.trill_rate > 0:
+            raise CompositionError(
+                f"trill_rate is the beats each note of a trill takes, a "
+                f"positive number (got {self.trill_rate!r})")
+        if not _real(self.swing) or not 0 < self.swing < 1:
+            raise CompositionError(
+                f"swing is between 0 and 1, 0.5 being straight (got "
+                f"{self.swing!r})")
+        if self.swing_unit not in ("eighth", "sixteenth"):
+            raise CompositionError('swing_unit is "eighth" or "sixteenth"')
+        if not _real(self.pickup) or self.pickup < 0:
+            raise CompositionError(
+                f"pickup is the beats before the first barline, 0 or more "
+                f"(got {self.pickup!r})")
+        if (not _real(self.humanize) or self.humanize < 0
+                or self.humanize % 1):
+            raise CompositionError(
+                f"humanize is a whole number, 0 or more (got "
+                f"{self.humanize!r})")
+        lo, hi = self.pitch_lo, self.pitch_hi
+        if not (_real(lo) and _real(hi) and 0 <= lo <= hi <= 127):
+            raise CompositionError(
+                f"pitch_range is (lowest, highest) MIDI notes within 0-127 "
+                f"(got {(lo, hi)!r})")
 
     def _dirty(self) -> None:
         """Invalidate the memoized event stream after a structural change.
@@ -2881,17 +3133,26 @@ class Song:
 
     def _render_sig(self):
         """A value signature of everything the render reads: the mutation
-        counter plus each Note's content. Comparing it by value means a
-        Note edited in place (which does not bump _rev) still invalidates
-        the memoized stream, closing the raw-API cache gap."""
-        return (self._rev, tuple(
-            (tuple(v.pedal_marks), tuple(
-                (tuple(n.pitches), n.beats, n.vel, n.gate,
-                 n.tie, n.grace, n.roll, n.trill, n.hold,
-                 tuple(n.vels) if n.vels else None)
-                for n in v.notes))
-            for sec in self.sections.values()
-            for v in sec.voices))
+        counter, the song's and each section's settings, and each Note's
+        content. Comparing it by value means a setting assigned or a Note
+        edited in place, neither of which bumps _rev, still invalidates
+        the memoized stream."""
+        return (self._rev, self.tempo, self.swing, self.swing_unit,
+                self.humanize, self.expressive, self.fermata, self.pickup,
+                tuple(self.order), tuple(sorted(self._tempo_changes.items())),
+                tuple(self._ramps), tuple(
+                    (name, sec.bpb, sec.time_sig,
+                     tuple(sorted(sec.meters.items())), sec.pedal_mode,
+                     sec.soft_pedal, sec.rubato_depth, sec.rubato_phrase,
+                     sec.rubato_shape, sec.swing_amount, sec.swing_unit,
+                     tuple(
+                         (v.name, v.channel, v.drums, tuple(v.pedal_marks),
+                          tuple((tuple(n.pitches), n.beats, n.vel, n.gate,
+                                 n.tie, n.grace, n.roll, n.trill, n.hold,
+                                 tuple(n.vels) if n.vels else None)
+                                for n in v.notes))
+                         for v in sec.voices))
+                    for name, sec in self.sections.items()))
 
     def section(self, name: str, key: str | None = None,
                 time: str | None = None) -> Section:
@@ -2916,11 +3177,18 @@ class Song:
         """Shift every already-entered note by a number of semitones,
         in place, and relabel the keys, each voice's signature included,
         so later bars() input, trills, and pitch metrics follow the new
-        key. Call it after the sections are written. Raises, changing
-        nothing, if any note would leave the instrument range."""
+        key. Drum voices stay as they are: their notes name instruments,
+        not pitches. Call it after the sections are written. Raises,
+        changing nothing, if any note would leave the instrument range."""
+        if not _real(semitones) or semitones % 1:
+            raise CompositionError(
+                f"transpose: semitones is a whole number (got {semitones!r})")
+        semitones = int(semitones)
         self._dirty()
         for sec in self.sections.values():
             for v in sec.voices:
+                if v.drums:
+                    continue
                 for n in v.notes:
                     for p in n.pitches:
                         if not self.pitch_lo <= p + semitones <= self.pitch_hi:
@@ -2943,6 +3211,8 @@ class Song:
 
         for sec in self.sections.values():
             for v in sec.voices:
+                if v.drums:
+                    continue
                 for n in v.notes:
                     n.pitches = [p + semitones for p in n.pitches]
                     if n.spell:
@@ -2955,7 +3225,29 @@ class Song:
         self.key = _transpose_key(self.key, semitones)
         return self
 
+    def _plan_check(self, what: str, section: str, bpm, *bars) -> None:
+        """A tempo instruction names a section that exists, bars counted
+        from 1, and a positive tempo."""
+        if not isinstance(section, str) or section not in self.sections:
+            raise CompositionError(
+                f"{what}: unknown section {section!r} — sections are "
+                f"{list(self.sections)} (make the section first)")
+        if not _real(bpm) or not bpm > 0:
+            raise CompositionError(
+                f"{what}: the tempo is beats per minute, a positive number "
+                f"(got {bpm!r})")
+        for bar in bars:
+            if not _real(bar) or bar < 1:
+                raise CompositionError(
+                    f"{what}: bars count from 1, the first full bar (got "
+                    f"{bar!r})")
+
     def tempo_change(self, section: str, bar: int, bpm: float) -> None:
+        """Set the tempo of `section` to `bpm` from `bar` on, bar 1 being
+        its first full bar (a pickup before it plays at bar 1's tempo).
+        The change belongs to its section: the next section begins at
+        the song tempo again."""
+        self._plan_check("tempo_change", section, bpm, bar)
         self._tempo_changes[(section, bar)] = bpm
         self._dirty()
 
@@ -2963,6 +3255,11 @@ class Song:
                    bpm_to: float) -> None:
         """Apply a linear tempo ramp across the given bars. A target
         faster than the prevailing tempo produces an accelerando."""
+        self._plan_check("ritardando", section, bpm_to, bar_from, bar_to)
+        if bar_to < bar_from:
+            raise CompositionError(
+                f"ritardando: the ramp ends at bar {bar_to}, before it "
+                f"begins at bar {bar_from}")
         self._ramps.append((section, bar_from, bar_to, bpm_to))
         self._dirty()
 
@@ -2992,7 +3289,10 @@ class Song:
         Note objects, each keeping its own velocity, so notation
         validation does not apply and saving the song again gives back
         the file's notes to the grid."""
-        mid = mido.MidiFile(path)
+        try:                           # titles and names: UTF-8 where the
+            mid = mido.MidiFile(path, charset="utf-8")     # file is, else
+        except UnicodeDecodeError:                         # Latin-1
+            mid = mido.MidiFile(path)
         tpb = mid.ticks_per_beat
         grid = grid or tpb
 
@@ -3067,13 +3367,13 @@ class Song:
                    expressive=False, pitch_range=(0, 127), title=title)
         sec = song.section(section)
         bar, start, bpb, now = 1, 0.0, _meter_beats(time0), time0
-        for tick, time in meters:
+        for tick, meter in meters:
             n = (cell(tick) / grid - start) / bpb
-            if (time != now and round(n) >= 1
+            if (meter != now and round(n) >= 1
                     and abs(n - round(n)) < 1e-6):
                 bar, start = bar + round(n), cell(tick) / grid
-                bpb, now = _meter_beats(time), time
-                sec.time_change(bar, time)
+                bpb, now = _meter_beats(meter), meter
+                sec.time_change(bar, meter)
 
         # The piece ends at its last release or its tracks' end, whichever
         # is later; a note shorter than a grid step takes one, inside it.
@@ -3219,6 +3519,7 @@ class Song:
     def _compute_events(self, order=None):
         import math
         import random
+        self._check_settings()
         rng = random.Random(20)
         events = []
         strikes = []               # (on, off) event pairs, settled at the end
@@ -3258,6 +3559,13 @@ class Song:
                 tb = 0.0                   # beats into the section
                 carried = None
                 pending_grace = []
+                # the next note that is not a grace, for each note: where
+                # a tie leads
+                after, later = [None] * len(v.notes), None
+                for k in range(len(v.notes) - 1, -1, -1):
+                    after[k] = later
+                    if not v.notes[k].grace:
+                        later = v.notes[k]
                 for i, n in enumerate(v.notes):
                     if n.grace:
                         pending_grace.append(n)
@@ -3270,8 +3578,7 @@ class Song:
                     if n.hold:
                         holds.append((t - cursor, t - cursor + ticks))
                     if n.pitches:
-                        nxt = next((m for m in v.notes[i + 1:]
-                                    if not m.grace), None)
+                        nxt = after[i]
                         if (n.tie and nxt
                                 and set(nxt.pitches) == set(n.pitches)):
                             carried = carried if carried is not None else t
@@ -3483,7 +3790,17 @@ class Song:
                 msg = mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(a))
                 role = None
             lanes[role].append((tick, rank, msg))
-        mid = mido.MidiFile(type=1 if tracks else 0, ticks_per_beat=TPB)
+        # A file's text is Latin-1, the long-standing convention, unless
+        # a title or a name needs more, when it is UTF-8.
+        text = "".join([self.title or "", self.composer or ""]
+                       + role_order + list(seq))
+        try:
+            text.encode("latin-1")
+            charset = "latin1"
+        except UnicodeEncodeError:
+            charset = "utf-8"
+        mid = mido.MidiFile(type=1 if tracks else 0, ticks_per_beat=TPB,
+                            charset=charset)
         groups = ([lanes[None]] + [lanes[r] for r in role_order] if tracks
                   else [[e for lane in lanes.values() for e in lane]])
         for index, lane in enumerate(groups):
@@ -3646,6 +3963,7 @@ class Song:
             seen.add(sec_name)
             sec = self.sections[sec_name]
             anac = sec._anacrusis()   # beats count from the first downbeat
+            where = sec._locator()
             issues = []
             spans = []
             for v in sec.voices:
@@ -3668,25 +3986,32 @@ class Song:
                     n1, iv1, on1 = spans[i]
                     n2, iv2, on2 = spans[j]
                     seen_coll = set()
-                    for (s1, e1, p1) in iv1:
-                        for (s2, e2, p2) in iv2:
-                            lo = max(s1, s2)
-                            if min(e1, e2) - lo <= 1e-6:
-                                continue
-                            shared = p1 & p2
-                            if not shared:
-                                continue
+                    both = set(on1) & set(on2)
+                    # Each voice's notes follow one another, so the pairs
+                    # that sound together are found by walking the two
+                    # voices side by side, in time proportional to their
+                    # length.
+                    a = b = 0
+                    while a < len(iv1) and b < len(iv2):
+                        s1, e1, p1 = iv1[a]
+                        s2, e2, p2 = iv2[b]
+                        lo = max(s1, s2)
+                        shared = p1 & p2
+                        if shared and min(e1, e2) - lo > 1e-6:
                             key = (round(lo, 6), frozenset(shared))
-                            if key in seen_coll:
-                                continue
-                            seen_coll.add(key)
-                            held = round(lo, 6) not in (
-                                set(on1) & set(on2))
-                            tag = "held-unison" if held else "unison"
-                            pitches = ",".join(str(p) for p in sorted(shared))
-                            issues.append(
-                                f"{tag} {n1}/{n2} at {sec.locate(lo)} "
-                                f"(MIDI {pitches})")
+                            if key not in seen_coll:
+                                seen_coll.add(key)
+                                held = round(lo, 6) not in both
+                                tag = "held-unison" if held else "unison"
+                                pitches = ",".join(str(p)
+                                                   for p in sorted(shared))
+                                issues.append(
+                                    f"{tag} {n1}/{n2} at {where(lo)} "
+                                    f"(MIDI {pitches})")
+                        if e1 <= e2:
+                            a += 1
+                        else:
+                            b += 1
                     if mode == "homophonic":
                         continue
                     # Sample each voice's sounding sonority at the union of
@@ -3694,17 +4019,27 @@ class Song:
                     # move together into the same perfect interval. Reading
                     # the sounding pitch, not only shared onsets, catches a
                     # parallel taken against a note held in the other voice.
-                    def sounding(iv, t):
-                        for (s, e, p) in iv:
-                            if s <= t < e - 1e-9:
-                                return p
-                        return None
+
+                    def sampler(iv):
+                        """A function giving the pitches a voice sounds at
+                        a time, for times asked in rising order."""
+                        k = 0
+
+                        def at(t):
+                            nonlocal k
+                            while k < len(iv) and iv[k][1] - 1e-9 <= t:
+                                k += 1
+                            if k < len(iv) and iv[k][0] <= t:
+                                return iv[k][2]
+                            return None
+                        return at
                     times = sorted({s for (s, _e, _p) in iv1}
                                    | {s for (s, _e, _p) in iv2})
                     seen_par = set()
                     prev = None
+                    snd1, snd2 = sampler(iv1), sampler(iv2)
                     for t in times:
-                        p1, p2 = sounding(iv1, t), sounding(iv2, t)
+                        p1, p2 = snd1(t), snd2(t)
                         if p1 is None or p2 is None:
                             prev = None            # a rest breaks the line
                             continue
@@ -3725,7 +4060,7 @@ class Song:
                                     seen_par.add(dkey)
                                     issues.append(
                                         f"parallel {kind} {n1}/{n2} at "
-                                        f"{sec.locate(t)} ({hi}/{low})")
+                                        f"{where(t)} ({hi}/{low})")
                         prev = (t, p1, p2)
                     if mode != "strict":
                         continue
@@ -3738,25 +4073,27 @@ class Song:
                                         if sum(a1) / len(a1) >= sum(a2) / len(a2)
                                         else (iv2, iv1))
                         seen_x = set()
+                        snd_hi, snd_lo = sampler(hi_iv), sampler(lo_iv)
                         for t in times:
-                            ph, pl = sounding(hi_iv, t), sounding(lo_iv, t)
+                            ph, pl = snd_hi(t), snd_lo(t)
                             if ph and pl and min(pl) > max(ph):
                                 k = round(t, 6)
                                 if k not in seen_x:
                                     seen_x.add(k)
                                     issues.append(
                                         f"voice crossing {n1}/{n2} at "
-                                        f"{sec.locate(t)} "
+                                        f"{where(t)} "
                                         f"({min(pl)} over {max(ph)})")
                     # unprepared dissonance: a hard dissonance struck in both
                     # voices on a beat, with neither note held to prepare it
                     seen_d = set()
+                    snd1, snd2 = sampler(iv1), sampler(iv2)
                     for t in times:
                         tb = t - anac
                         if (round(t, 6) not in on1 or round(t, 6) not in on2
                                 or abs(tb - round(tb)) > 1e-6):
                             continue
-                        p1, p2 = sounding(iv1, t), sounding(iv2, t)
+                        p1, p2 = snd1(t), snd2(t)
                         if not p1 or not p2:
                             continue
                         d = abs(max(p1) - max(p2)) % 12
@@ -3766,7 +4103,7 @@ class Song:
                                 seen_d.add(k)
                                 issues.append(
                                     f"unprepared dissonance {n1}/{n2} at "
-                                    f"{sec.locate(t)} (interval {d})")
+                                    f"{where(t)} (interval {d})")
             if mode == "strict":
                 kn = sec.key or self.key
                 root = kn[:-1] if kn.endswith("m") else kn
@@ -3784,7 +4121,7 @@ class Song:
                         if nxt is None or abs(nxt - tp) > 2:   # exposed, not step
                             issues.append(
                                 f"unresolved leading tone {name} at "
-                                f"{sec.locate(starts[k])} (MIDI {tp})")
+                                f"{where(starts[k])} (MIDI {tp})")
                     allp = sorted(pp for (_s, _e, p) in iv for pp in p)
                     if allp:
                         med, span = allp[len(allp) // 2], allp[-1] - allp[0]
@@ -3809,7 +4146,7 @@ class Song:
                                  if len(n.pitches) > 1 else 0)
                         if reach > 16 and not n.roll:
                             issues.append(
-                                f"wide chord {v.name} at {sec.locate(t)}: "
+                                f"wide chord {v.name} at {where(t)}: "
                                 f"spans {reach} semitones — roll it (&) or "
                                 f"split it between the hands")
                         t += n.beats
@@ -3826,6 +4163,7 @@ class Song:
         """Return a structured summary of the song: sections, voices,
         ranges, note density, tempo-integrated duration, and lint
         findings."""
+        self._check_settings()
         order = self.order or list(self.sections)
         out = {"tempo": self.tempo, "key": self.key,
                "beats_per_bar": self.beats_per_bar,
@@ -3922,6 +4260,7 @@ class Song:
         for name in self._sections("rubs", only):
             sec = self.sections[name]
             length = sec.length_beats()
+            where = sec._locator(length)
             downs = self._pedal_plan(sec, length)
 
             def rings_to(end):
@@ -3986,7 +4325,7 @@ class Song:
                     seen.add(k)
                     both = round(overlap, 3)
                     found.append(
-                        f"[{name}] rub {lo[1]}/{hi[1]} at {sec.locate(s0)}: "
+                        f"[{name}] rub {lo[1]}/{hi[1]} at {where(s0)}: "
                         f"{lo[2]} against {hi[2]} ({_RUB[d]}), ringing "
                         f"together {both:g} beat{'' if both == 1 else 's'}")
                 active.append((s0, e0, p, role, name0))
@@ -4014,6 +4353,7 @@ class Song:
         out = []
         for name in self._sections("find", only):
             sec = self.sections[name]
+            where = sec._locator()
             for v in sec.voices:
                 if v.drums:
                     continue
@@ -4023,7 +4363,7 @@ class Song:
                     if shift is not None:
                         out.append({"section": name,
                                     "voice": v.name.split(".", 1)[1],
-                                    "at": sec.locate(line[i][0]),
+                                    "at": where(line[i][0]),
                                     "semitones": shift})
         return out
 
@@ -4048,16 +4388,19 @@ class Song:
             sec = self.sections[name]
             length = sec.length_beats()
             anac = sec._anacrusis()
-            sounding = []
+            tracks = []            # per voice: (start, end, pitches) in order
             for v in sec.voices:
                 if v.drums:
                     continue
-                t = 0.0
+                t, track = 0.0, []
                 for n in v.notes:
                     if n.grace:
                         continue
-                    sounding += [(t, t + n.beats, p) for p in n.pitches]
+                    if n.pitches:
+                        track.append((t, t + n.beats, n.pitches))
                     t += n.beats
+                tracks.append(track)
+            where = sec._locator(length)
             edges = {0.0, length}
             if per == "beat":
                 k = 0
@@ -4071,19 +4414,31 @@ class Song:
                         edges.add(round(start + beats / 2, 9))
             edges = sorted(edges)
             flat = KEYS.get(_resolve_key(sec.key or self.key), (0, "#"))[1] == "b"
+            # The windows rise in time and each voice's notes follow one
+            # another, so each voice is read once, from where the last
+            # window left it.
+            first = [0] * len(tracks)
             for a, b in zip(edges, edges[1:]):
                 weight = [0.0] * 12
                 bass = None
-                for s0, e0, p in sounding:
-                    overlap = min(e0, b) - max(s0, a)
-                    if overlap > 1e-9:
-                        weight[p % 12] += overlap
-                        bass = p if bass is None else min(bass, p)
+                for ti, track in enumerate(tracks):
+                    k = first[ti]
+                    while k < len(track) and track[k][1] - a <= 1e-9:
+                        k += 1                    # over before this window
+                    first[ti] = k
+                    while k < len(track) and track[k][0] < b:
+                        s0, e0, pitches = track[k]
+                        overlap = min(e0, b) - max(s0, a)
+                        if overlap > 1e-9:
+                            for p in pitches:
+                                weight[p % 12] += overlap
+                                bass = p if bass is None else min(bass, p)
+                        k += 1
                 chord = _name_chord(weight, bass, flat)
                 if out and out[-1]["section"] == name and out[-1]["chord"] == chord:
                     out[-1]["beats"] = round(out[-1]["beats"] + b - a, 6)
                     continue
-                out.append({"section": name, "at": sec.locate(a),
+                out.append({"section": name, "at": where(a),
                             "beats": round(b - a, 6), "chord": chord})
         return out
 
@@ -4197,35 +4552,23 @@ class Song:
                 attack += "\\arpeggio"
             return attack, ("\\fermata" if n.hold else "")
 
-        def bar_start(grid, bar):
-            """The beat where bar number `bar` begins, continuing past the
-            section's end in its last meter."""
-            full = [g for g in grid if g[2] >= 1]
-            for start, _beats, number, _time in full:
-                if number == bar:
-                    return start
-            if not full:
-                return 0.0
-            start, beats, number, _time = full[-1]
-            return start + (bar - number) * beats
-
         def cues(sec_name, sec):
-            """Beat -> tempo mark for the section: a step change as a
-            metronome mark, a ramp as rit. or accel., both in one mark
-            where they start together."""
+            """Beat -> [word, metronome mark] for the section: a step
+            change as a metronome mark, a ramp as rit. or accel., both
+            in one mark where they start together."""
             length = sec.length_beats()
-            grid = sec.bar_grid(length)
+            beat_of = sec._bar_beat(length)
             bpm_at, _has_plan = self._base_bpm_fn(
                 sec_name, sec._bar_position(length))
             marks_at = {}
             for (sn, bar), bpm in self._tempo_changes.items():
                 if sn == sec_name:
-                    b = bar_start(grid, bar)
+                    b = round(beat_of(bar), 6)
                     marks_at.setdefault(b, ["", ""])[1] = (
                         f"4 = {int(round(bpm))}")
             for sn, f, t, bpm in self._ramps:
                 if sn == sec_name:
-                    b = bar_start(grid, f)
+                    b = round(beat_of(f), 6)
                     if t <= f:               # a ramp of no length is a step
                         marks_at.setdefault(b, ["", ""])[1] = (
                             f"4 = {int(round(bpm))}")
@@ -4235,8 +4578,29 @@ class Song:
                     if abs(bpm - was) > 1e-9:
                         word = "rit." if bpm < was else "accel."
                         marks_at.setdefault(b, ["", ""])[0] = f'"{word}"'
-            return {b: "\\tempo " + " ".join(x for x in m if x) + " "
-                    for b, m in marks_at.items()}
+            return marks_at
+
+        # The tempo marks of each section in the arrangement: its own
+        # changes and ramps, and a metronome mark where it opens at a
+        # tempo the reader was not last given. The piece's first mark is
+        # one of these, and a section with no plan of its own is marked
+        # back to the song tempo after one that left it.
+        tempo_marks, shown = [], None
+        for name in order:
+            sec = self.sections[name]
+            sec_len = sec.length_beats()
+            bpm_at = self._base_bpm_fn(name, sec._bar_position(sec_len))[0]
+            at = cues(name, sec)
+            opening = bpm_at(0)
+            if shown is None or abs(opening - shown) > 1e-9:
+                metro = f"4 = {int(round(opening))}"
+                at.setdefault(0.0, ["", ""])[1] = metro
+                first = round(sec._anacrusis_of(sec_len), 6)
+                if first and at.get(first) == ["", metro]:
+                    del at[first]            # said once, before the pickup
+            shown = bpm_at(round(sec_len * TPB))
+            tempo_marks.append({b: "\\tempo " + " ".join(x for x in m if x)
+                                + " " for b, m in at.items()})
 
         def meter_marks(sec, grid):
             """Beat -> \\time command where the meter changes inside the
@@ -4389,8 +4753,9 @@ class Song:
                     grace.append(pitch_names(n, flat)[0] + "8")
                     i += 1
                     continue
-                if grace:
-                    out.append("\\grace { " + " ".join(grace) + " }")
+                if grace:                # marks due here precede the graces
+                    out.append(before(pos) + "\\grace { " + " ".join(grace)
+                               + " }")
                     grace = []
                 if n.trill and n.pitches:           # a trill, written whole
                     j, total = i, 0.0
@@ -4413,7 +4778,8 @@ class Song:
                            and notes[i].tup[0][0] == gid):
                         idxs.append(i)
                         i += 1
-                    out.append(group(idxs, 0, Fraction(1)))
+                    # marks due here go ahead of the bracket, not inside it
+                    out.append(before(pos) + group(idxs, 0, Fraction(1)))
                     continue
                 d = dur_of(n.beats)
                 if not d and pieces(n.beats) is None and not any(
@@ -4427,6 +4793,7 @@ class Song:
                         grp.append((i, notes[i]))
                         i += 1
                     for k in range(0, len(grp), size):
+                        pre = before(pos)       # ahead of the bracket
                         inner = []
                         for j, g in grp[k:k + size]:
                             lead = before(pos)
@@ -4435,7 +4802,7 @@ class Song:
                                         else note_str(g, flat, v.drums) + wd)
                                 + after(j, pos) + ("~" if g.tie else ""))
                             pos += b
-                        out.append(f"\\tuplet {size}/{den} {{ "
+                        out.append(pre + f"\\tuplet {size}/{den} {{ "
                                    + " ".join(inner) + " }")
                     continue
                 if not n.pitches:
@@ -4446,6 +4813,11 @@ class Song:
                                     attack + after(i, pos), release, n.tie))
                 pos += n.beats
                 i += 1
+            # a hairpin whose closing dynamic comes after the last note
+            # ends with the section
+            if v.hairpins and max(v.hairpins) < len(notes) and not any(
+                    max(v.hairpins) < d < len(notes) for d in v.dyn_marks):
+                out.append("s1*0\\!")
             if down and not last_section:   # lift where the section ends; the
                 out.append("s1*0\\sustainOff")  # piece's end closes the last
             return " ".join(out)
@@ -4491,7 +4863,7 @@ class Song:
                                    if any(x.name.split(".", 1)[1] == r
                                           for x in sec.voices))
                     seg += body(v, flat,
-                                cues(name, sec) if role == carrier else {},
+                                tempo_marks[index] if role == carrier else {},
                                 meters_at, [g[0] for g in grid if g[0] > 0],
                                 index == len(order) - 1)
                 parts.append(seg)
@@ -4504,24 +4876,21 @@ class Song:
             clef = ("\\clef bass " if not drums and sounded
                     and sounded[len(sounded) // 2] < 57 else "")
             staves.append(
-                f'  \\new {kind} \\with {{ instrumentName = "{role}" }} '
-                f'{mode}{{\n'
-                f'    {clef}\\tempo 4 = {int(round(self.tempo))} '
-                + " ".join(parts) + "\n  }")
+                f'  \\new {kind} \\with {{ instrumentName = '
+                f'{_ly_string(role)} }} {mode}{{\n'
+                f'    {clef}' + " ".join(parts) + "\n  }")
         # two pitched staves and nothing else are one piano's two hands
         if len(staves) == 2 and not drum_roles:
             staves = ["  \\new PianoStaff <<\n"
                       + "\n".join("  " + x.replace("\n", "\n  ") for x in staves)
                       + "\n  >>"]
 
-        def quoted(text):
-            return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
         header = ""
         if self.title or self.composer:
             header = ("\\header {\n"
-                      + (f"  title = {quoted(self.title)}\n" if self.title
-                         else "")
-                      + (f"  composer = {quoted(self.composer)}\n"
+                      + (f"  title = {_ly_string(self.title)}\n"
+                         if self.title else "")
+                      + (f"  composer = {_ly_string(self.composer)}\n"
                          if self.composer else "")
                       + "}\n\n")
         src = ('\\version "2.24.0"\n\\language "english"\n\n' + header
@@ -4583,10 +4952,10 @@ WORKED EXAMPLE
     A = s.section("A")
     A.voice("rh", vel=52).bars(
         f"!mp {MOTIF} b4q | {shift(MOTIF, -1)} a4q |"
-        "  e5q {d5 c5 b4}q a4h |"           # triplet on beat two
+        "  e5q {d5 c5 b4}q g#4h |"          # triplet on beat two
         "  [a3 c4 e4]w^& |")                # rolled final chord, fermata
     lh = A.voice("lh", vel=36)
-    lh.harmony("Am G Am E7", style="broken", voicing="smooth",
+    lh.harmony("Am G E7 Am", style="alberti", voicing="smooth", octave=2,
                avoid=A.voices[0])           # dodge the melody's pitches
     A.pedal("bar")
     s.ritardando("A", 3, 4, 70)             # smooth final rit
